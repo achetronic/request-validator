@@ -1,0 +1,117 @@
+name: Release binaries
+
+# Triggered automatically when a GitHub Release is created, or manually via the
+# Actions UI. The manual run takes a SemVer tag and a boolean choosing whether
+# the source code should come from that tag or from `master`. Either way the
+# artefacts are published to the release whose name matches the SemVer tag.
+
+on:
+  release:
+    types: [created]
+
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release tag to publish artefacts to (SemVer, e.g. v0.1.0)'
+        required: true
+        default: v0.1.0
+      checkout_master:
+        description: 'Build from master instead of the release tag'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  binaries:
+    name: Build & upload binaries
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # linux + darwin on amd64 and arm64. We skip 32-bit by default.
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+
+    steps:
+      - id: read_tag
+        name: Resolve release tag and checkout ref
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.ref_name }}"
+            REF="${{ github.ref_name }}"
+          else
+            TAG="${{ inputs.release }}"
+            if [ "${{ inputs.checkout_master }}" = "true" ]; then
+              REF="master"
+            else
+              REF="${{ inputs.release }}"
+            fi
+          fi
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Publishing to '${TAG}' from ref '${REF}'"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.read_tag.outputs.checkout_ref }}
+
+      - name: Read Go version from go.mod
+        id: read_go_version
+        run: |
+          go_version=$(grep -E "^go [0-9]" go.mod | awk '{print $2}')
+          echo "go_version=${go_version}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '${{ steps.read_go_version.outputs.go_version }}'
+
+      - name: Build binary
+        env:
+          GOOS:    ${{ matrix.goos }}
+          GOARCH:  ${{ matrix.goarch }}
+          VERSION: ${{ steps.read_tag.outputs.release_tag }}
+        run: |
+          make build
+
+      - name: Package and sign
+        id: pkg
+        env:
+          GOOS:    ${{ matrix.goos }}
+          GOARCH:  ${{ matrix.goarch }}
+          VERSION: ${{ steps.read_tag.outputs.release_tag }}
+        run: |
+          make package
+          make package-signature
+          PACKAGE_NAME="request-validator-${VERSION}-${GOOS}-${GOARCH}.tar.gz"
+          echo "package_name=${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file:       dist/${{ steps.pkg.outputs.package_name }}
+          asset_name: ${{ steps.pkg.outputs.package_name }}
+          tag:        ${{ steps.read_tag.outputs.release_tag }}
+          overwrite:  true
+
+      - name: Upload MD5 to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file:       dist/${{ steps.pkg.outputs.package_name }}.md5
+          asset_name: ${{ steps.pkg.outputs.package_name }}.md5
+          tag:        ${{ steps.read_tag.outputs.release_tag }}
+          overwrite:  true
+
+      - name: Upload SHA256 to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file:       dist/${{ steps.pkg.outputs.package_name }}.sha256
+          asset_name: ${{ steps.pkg.outputs.package_name }}.sha256
+          tag:        ${{ steps.read_tag.outputs.release_tag }}
+          overwrite:  true

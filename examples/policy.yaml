@@ -1,0 +1,241 @@
+# Example policy for the Keycloak DCR (Dynamic Client Registration) endpoint
+# on auth.example-1.com / auth.example-2.com, restricted to the `mcp` realm.
+# The corporate Keycloak hostname is always denied.
+#
+# Trust model summary:
+#   internal    by source IP (10.0.0.0/8).
+#   Claude      by source IP, published ranges (legacy + new pool).
+#   ChatGPT     by source IP, fetched live from OpenAI's JSON feed.
+#   Mistral     same as ChatGPT but in dryRun while we wait for confirmation.
+#   Antigravity by the redirect_uris claimed in the DCR body. Antigravity
+#               runs on the user's machine so the source IP is residential.
+#
+# Useful links:
+#   https://platform.claude.com/docs/en/api/ip-addresses
+#   https://openai.com/chatgpt-actions.json
+#   https://mistral.ai/mistralai-user-ips.json
+#   https://antigravity.google/assets/docs/tools/mcp.md
+#   https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/
+
+
+# Engine-wide settings. What happens when no group decides, how big a body
+# we are willing to read, and whether evaluation errors should fail open.
+defaults:
+  action: deny
+  denyStatus: 403
+  denyBody: "Forbidden"
+  maxBodyBytes: 1MiB
+  allowOnError: false
+
+
+# Logging produces one structured access-log record per request, plus
+# anything the engine wants to say (boot, reload, fact fetch failures,
+# etc.). The CLI flags --log-level and --log-format, when set, override
+# the values in this section.
+#
+# Headers in `excludeHeaders` never appear in the log. Headers in
+# `redactHeaders` appear but with their value masked: the first
+# `redactReveal` characters are shown, the rest is replaced with '*'.
+# Values shorter than `2 * redactReveal` are fully masked, so short
+# tokens don't leak by accident.
+logging:
+  level: info               # debug | info | warn | error
+  format: json              # json | console
+  logBody: false            # opt-in: dump request body to the log
+  redactReveal: 6
+  excludeHeaders:
+    - cookie
+    - set-cookie
+  redactHeaders:
+    - authorization
+    - proxy-authorization
+    - x-api-key
+    - x-auth-token
+  redactQueryParams:
+    - access_token
+    - id_token
+    - code
+
+
+# Named external values referenced as `facts.<name>` from CEL.
+#
+# Three ways to load each one:
+#   value   inline literal (any YAML shape).
+#   file    bytes read from disk; exposed as a raw string.
+#   url     bytes fetched periodically in background; exposed as a raw
+#           string. Parse with parseJSON(...) / parseYAML(...) at use site.
+#
+# Facts are for data that changes more often than the policy itself
+# (published CIDR feeds, allow-lists rendered by a CronJob, etc.). Things
+# that are fixed properties of a provider go inline in their rule.
+facts:
+
+  # Our own internal network.
+  - name: internalCidrs
+    method: value
+    value:
+      - 10.0.0.0/8
+
+  # Anthropic's stable outbound ranges (Web GUI legacy + new pool). They
+  # publish these and they don't change often, so inline is fine.
+  - name: claudeCidrs
+    method: value
+    value:
+      - 160.79.104.0/21
+      - 34.162.46.92/32
+      - 34.162.102.82/32
+      - 34.162.136.91/32
+      - 34.162.142.92/32
+      - 34.162.183.95/32
+
+  # OpenAI / ChatGPT outbound JSON. Refreshed every 10 minutes in the
+  # background; CEL reads the in-memory copy on every request.
+  # Shape: {"creationTime": "...", "prefixes": [{"ipv4Prefix": "..."}, ...]}
+  - name: chatgptFeed
+    method: url
+    url:
+      address: https://openai.com/chatgpt-actions.json
+      interval: 10m
+      timeout: 15s
+
+  # Mistral published outbound feed. Same shape as the ChatGPT one. Kept
+  # in dryRun in its rule below until Mistral confirms MCP traffic comes
+  # from the same pool as the crawler.
+  - name: mistralFeed
+    method: url
+    url:
+      address: https://mistral.ai/mistralai-user-ips.json
+      interval: 10m
+      timeout: 15s
+
+
+# Ordered list of rule buckets. The first group whose `match` is true and
+# whose internal rules produce a verdict wins; otherwise defaults.action
+# applies.
+#
+# Per-group `mode`:
+#   firstMatch (default): the first rule whose `match` is true decides.
+#   all:                  every rule must match, otherwise the group denies.
+#
+# A rule inherits its `action` from the group unless it declares its own.
+groups:
+
+  # Corporate Keycloak: DCR is never allowed here.
+  - name: dcr-corporate-deny
+    action: deny
+    rules:
+      - name: block-corporate
+        match: |
+          request.host == 'keycloak.internal.example-1.com' &&
+          request.path.matches('^/realms/[^/]+/clients-registrations(/.*)?$')
+
+  # Anything coming from the internal network on the mcp realm gets in.
+  - name: dcr-internal
+    action: allow
+    match: |
+      request.method == 'POST' &&
+      request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
+      request.path.matches('^/realms/mcp/clients-registrations(/.*)?$')
+    rules:
+      - name: from-internal-cidr
+        match: inCIDR(request.remoteIp, facts.internalCidrs)
+
+  # Claude calls in from a small, stable set of CIDRs.
+  - name: dcr-claude
+    action: allow
+    match: |
+      request.method == 'POST' &&
+      request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
+      request.path.matches('^/realms/mcp/clients-registrations(/.*)?$')
+    rules:
+      - name: from-claude-cidr
+        match: inCIDR(request.remoteIp, facts.claudeCidrs)
+
+  # ChatGPT calls in from the CIDRs OpenAI publishes. The scope is guarded
+  # so the rule simply doesn't fire if the feed hasn't been populated yet
+  # (tests, or the few seconds before the first successful fetch on boot).
+  - name: dcr-chatgpt
+    action: allow
+    match: |
+      request.method == 'POST' &&
+      request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
+      request.path.matches('^/realms/mcp/clients-registrations(/.*)?$') &&
+      facts.chatgptFeed != null && facts.chatgptFeed != ""
+    rules:
+      - name: from-openai-feed
+        match: |
+          inCIDR(request.remoteIp,
+            parseJSON(facts.chatgptFeed).prefixes.map(p, p.ipv4Prefix))
+
+  # Mistral, in dry-run for now. Same shape as the ChatGPT rule.
+  - name: dcr-mistral
+    action: allow
+    match: |
+      request.method == 'POST' &&
+      request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
+      request.path.matches('^/realms/mcp/clients-registrations(/.*)?$') &&
+      facts.mistralFeed != null && facts.mistralFeed != ""
+    rules:
+      - name: from-mistral-feed
+        dryRun: true
+        match: |
+          inCIDR(request.remoteIp,
+            parseJSON(facts.mistralFeed).prefixes.map(p, p.ipv4Prefix))
+
+  # Antigravity runs on the end user's machine, so the source IP is
+  # whatever residential ISP they're on. We have to recognise the client
+  # by what it claims at registration. Two shapes are accepted, both
+  # documented at https://antigravity.google/assets/docs/tools/mcp.md:
+  #
+  #   - the canonical Google-hosted callback (manual OAuth setup),
+  #   - HTTPS loopback with a dynamic high port (RFC 8252 + Google's
+  #     HTTPS-only policy for loopback).
+  #
+  # Both are fixed properties of the Antigravity client, so they live in
+  # the rule itself rather than as facts.
+  - name: dcr-antigravity
+    action: allow
+    match: |
+      request.method == 'POST' &&
+      request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
+      request.path.matches('^/realms/mcp/clients-registrations(/.*)?$') &&
+      request.body.jsonOk &&
+      request.body.contentType.contains('application/json')
+    rules:
+      # Sanity cap: more than 5 redirect URIs is fishy regardless of shape.
+      - name: too-many-redirects
+        action: deny
+        match: "size(request.body.json.redirect_uris) > 5"
+
+      # The canonical Google-hosted callback, used when OAuth is set up
+      # manually instead of through DCR. Exactly one URI, fixed value.
+      - name: canonical-google-host
+        match: |
+          size(request.body.json.redirect_uris) == 1 &&
+          request.body.json.redirect_uris[0] == 'https://antigravity.google/oauth-callback'
+
+      # DCR-issued loopback clients. Every redirect_uri must be HTTPS,
+      # loopback, with a non-empty port. We also sanity-check the
+      # MCP-mandated OAuth params when the body contains them; RFC 7591
+      # makes them optional so absence is tolerated.
+      - name: dcr-loopback-mcp
+        match: |
+          size(request.body.json.redirect_uris) > 0 &&
+          request.body.json.redirect_uris.all(u,
+            u.matches('^https://(localhost|127\\.0\\.0\\.1):[0-9]{1,5}(/.*)?$')) &&
+          (!has(request.body.json.grant_types) ||
+              request.body.json.grant_types == ['authorization_code']) &&
+          (!has(request.body.json.response_types) ||
+              request.body.json.response_types == ['code']) &&
+          (!has(request.body.json.token_endpoint_auth_method) ||
+              request.body.json.token_endpoint_auth_method == 'none')
+
+  # The master realm is for administrators only. Nobody should reach it
+  # through the public hostname.
+  - name: block-master-realm-public
+    action: deny
+    rules:
+      - name: block
+        match: |
+          request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
+          request.path.startsWith('/realms/master')

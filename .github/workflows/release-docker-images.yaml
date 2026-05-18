@@ -1,0 +1,100 @@
+name: Release docker image
+
+# Builds and pushes a multi-arch container image to GHCR. Triggered when a
+# release is created, or manually with a SemVer tag and an optional toggle
+# to build from master instead of the tag.
+
+on:
+  release:
+    types: [created]
+
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release tag to publish the image as (SemVer, e.g. v0.1.0)'
+        required: true
+        default: v0.1.0
+      checkout_master:
+        description: 'Build from master instead of the release tag'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - id: read_tag
+        name: Resolve release tag and checkout ref
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.ref_name }}"
+            REF="${{ github.ref_name }}"
+          else
+            TAG="${{ inputs.release }}"
+            if [ "${{ inputs.checkout_master }}" = "true" ]; then
+              REF="master"
+            else
+              REF="${{ inputs.release }}"
+            fi
+          fi
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Building ghcr.io image ${TAG} from ref ${REF}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.read_tag.outputs.checkout_ref }}
+
+      - name: Read Go version from go.mod
+        id: read_go_version
+        run: |
+          go_version=$(grep -E "^go [0-9]" go.mod | awk '{print $2}')
+          echo "go_version=${go_version}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '${{ steps.read_go_version.outputs.go_version }}'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:latest
+          platforms: all
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push multi-arch image
+        env:
+          VERSION: ${{ steps.read_tag.outputs.release_tag }}
+        run: |
+          # Lowercase the repository name; GHCR rejects uppercase.
+          REPO="${GITHUB_REPOSITORY,,}"
+          export IMG="ghcr.io/${REPO}:${VERSION}"
+
+          # Also tag :latest when triggered by a real release (not manual).
+          EXTRA_TAGS=""
+          if [ "${{ github.event_name }}" = "release" ]; then
+            EXTRA_TAGS="-t ghcr.io/${REPO}:latest"
+          fi
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="${VERSION}" \
+            -t "${IMG}" \
+            ${EXTRA_TAGS} \
+            --push \
+            .
