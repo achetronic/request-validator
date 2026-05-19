@@ -86,9 +86,17 @@ spec:
         - operation:
             # Adjust to the endpoints you want to gate. The example below
             # targets Keycloak Dynamic Client Registration on every realm.
+            #
+            # Path matcher syntax (Istio v1):
+            #   `{*}`  matches exactly one path segment (no slashes).
+            #   `{**}` matches zero or more path segments (slashes allowed).
+            # Plain `*` only matches a single segment, so a pattern like
+            # `/realms/*/clients-registrations/*` would NOT match the real
+            # OIDC DCR endpoint
+            # `/realms/<realm>/clients-registrations/openid-connect`.
             paths:
-              - /realms/*/clients-registrations
-              - /realms/*/clients-registrations/*
+              - /realms/{*}/clients-registrations
+              - /realms/{*}/clients-registrations/{**}
 
 ---
 
@@ -131,7 +139,6 @@ spec:
               patterns:
                 - safe_regex:
                     regex: ".*"
-                  ignore_case: true
             # Drop mesh-internal noise that doesn't help decisions and only
             # inflates every check payload. Trim more as you go.
             #
@@ -139,13 +146,16 @@ spec:
             # peer mTLS identity today. If you start writing rules that
             # read `request.headers['x-forwarded-client-cert']`, remove
             # that line.
+            #
+            # NOTE: ignore_case is intentionally NOT set on any of these
+            # patterns. Envoy rejects the listener if ignore_case appears
+            # inside safe_regex (it's only valid on string_match/prefix/exact
+            # before the StringMatcher refactor), and HTTP/2 + Envoy
+            # normalise header names to lowercase anyway, so it is
+            # redundant for prefix/exact too.
             disallowed_headers:
               patterns:
                 - prefix: "x-envoy-"
-                  ignore_case: true
                 - prefix: "x-b3-"
-                  ignore_case: true
                 - exact: "x-request-id"
-                  ignore_case: true
                 - exact: "x-forwarded-client-cert"
-                  ignore_case: true
