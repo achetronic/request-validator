@@ -120,6 +120,14 @@ facts:
 # A rule inherits its `action` from the group unless it declares its own.
 groups:
 
+  # NOTE on Keycloak DCR paths.
+  # The real OIDC Dynamic Client Registration endpoint that clients hit is
+  # `/realms/<realm>/clients-registrations/openid-connect[/<clientId>]`.
+  # The regex `^/realms/[^/]+/clients-registrations(/.*)?$` covers both the
+  # bare collection path and the `/openid-connect[/...]` sub-paths. The
+  # paired Istio AuthorizationPolicy needs glob patterns that span slashes
+  # too - see examples/config-for-istio.yaml for the `{*}` / `{**}` syntax.
+
   # Corporate Keycloak: DCR is never allowed here.
   - name: dcr-corporate-deny
     action: deny
