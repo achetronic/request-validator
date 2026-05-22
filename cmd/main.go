@@ -6,7 +6,7 @@
 //
 //	@title						request-validator admin API
 //	@version					v1
-//	@description				CRUD over the CRDT-backed sections of the policy: groups, facts, defaults, logging. The YAML loaded at boot is the floor; admin writes overlay it per-key and are gossiped to peer replicas. Every write rebuilds the effective config and either applies it atomically or quarantines the offending entry.
+//	@description				CRUD over the overlay sections of the policy (groups, facts, defaults, logging). The YAML loaded at boot is the floor; admin writes overlay it per-key and are replicated to peer replicas via a Kubernetes ConfigMap + Lease.
 //	@BasePath					/
 //	@securityDefinitions.apikey	BearerAuth
 //	@in							header
@@ -16,27 +16,29 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+
 	"request-validator/internal/adminapi"
 	"request-validator/internal/cluster"
 	"request-validator/internal/configwatch"
-	"request-validator/internal/crdt"
 	"request-validator/internal/httpserver"
 	"request-validator/internal/log"
 	rvmetrics "request-validator/internal/metrics"
 	"request-validator/internal/policy"
-	"request-validator/internal/quarantine"
+	"request-validator/internal/state"
+	"request-validator/internal/state/configmap"
+	"request-validator/internal/state/memory"
 )
 
 // version is injected at build time via -ldflags="-X main.version=<semver>".
@@ -44,22 +46,22 @@ var version = "dev"
 
 func main() {
 	var (
-		port            = flag.Int("port", 8080, "HTTP server port (ext-authz)")
+		port            = flag.Int("port", 8080, "ext-authz HTTP port")
 		configPath      = flag.String("config", "policy.yaml", "Path to the policy file")
-		level           = flag.String("log-level", "", "Override logging.level from the policy file (debug|info|warn|error)")
-		format          = flag.String("log-format", "", "Override logging.format from the policy file (json|console)")
-		watch           = flag.Bool("watch", true, "Auto-reload the policy when the config file changes")
+		level           = flag.String("log-level", "", "Override logging.level (debug|info|warn|error)")
+		format          = flag.String("log-format", "", "Override logging.format (json|console)")
+		watch           = flag.Bool("watch", true, "Auto-reload the policy on file changes (default true)")
 		watchDebounceMs = flag.Int("watch-debounce-ms", 200, "Debounce window for the config file watcher")
 
-		adminPort      = flag.Int("admin-port", 8081, "Admin API port (only enabled if --admin-token-file is set)")
-		adminTokenFile = flag.String("admin-token-file", "", "Path to a file containing the admin API bearer token; without it the admin API is disabled")
-		stateFile      = flag.String("state-file", "", "Path to the CRDT state file; empty disables persistence (in-memory only)")
+		adminPort      = flag.Int("admin-port", 8081, "Admin API port; only started if --admin-token-file is set")
+		adminTokenFile = flag.String("admin-token-file", "", "File holding the admin API bearer token; empty disables the admin API")
 
-		clusterBind      = flag.String("cluster-bind", "", "Memberlist gossip bind addr (host:port); empty disables clustering")
-		clusterAdvertise = flag.String("cluster-advertise", "", "Memberlist advertise addr (host:port); defaults to --cluster-bind")
-		clusterPeers     = flag.String("cluster-peers", "", "Comma-separated host:port seed peers to join at boot")
-		clusterDNS       = flag.String("cluster-discovery-dns", "", "DNS name to resolve periodically for peer discovery (e.g. a Kubernetes headless Service)")
-		clusterDNSEvery  = flag.Duration("cluster-discovery-interval", 30*time.Second, "How often to re-resolve --cluster-discovery-dns")
+		namespace      = flag.String("namespace", "", "Kubernetes namespace for the state ConfigMap and Lease; defaults to in-pod namespace")
+		stateConfigMap = flag.String("state-configmap", "request-validator-state", "Name of the ConfigMap that holds the admin overlay")
+		leaderLease    = flag.String("leader-lease", "request-validator-leader", "Name of the Lease used for leader election")
+		kubeconfig     = flag.String("kubeconfig", "", "Path to a kubeconfig file (empty = in-cluster config)")
+		noKubernetes   = flag.Bool("no-kubernetes", false, "Disable all Kubernetes integration; use in-memory state with optional --state-file")
+		stateFile      = flag.String("state-file", "", "Local JSON file for state persistence in standalone mode")
 
 		showVersion = flag.Bool("version", false, "Print version and exit")
 	)
@@ -73,10 +75,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Raw YAML bytes are kept current via fsnotify so every rebuild (the
-	// CRDT path, SIGHUP, fsnotify itself) sees the latest policy file.
+	// Read the policy YAML up front so we have something to merge
+	// against even before kube initialization completes.
 	var yamlMu sync.RWMutex
-	var yamlBytes []byte
 	readYAML := func() ([]byte, error) {
 		raw, err := os.ReadFile(*configPath)
 		if err != nil {
@@ -84,31 +85,56 @@ func main() {
 		}
 		return []byte(os.ExpandEnv(string(raw))), nil
 	}
-	initialYAML, err := readYAML()
+	yamlBytes, err := readYAML()
 	if err != nil {
 		log.Fatalf("read policy: %v", err)
 	}
-	yamlBytes = initialYAML
 
-	// CRDT store: persist when --state-file is given.
-	nodeID, err := resolveNodeID(*stateFile)
-	if err != nil {
-		log.Fatalf("resolve node id: %v", err)
+	// Build the state store. Kubernetes when available, in-memory
+	// otherwise (also forced by --no-kubernetes for tests / dev).
+	var (
+		store       state.Store
+		clusterNode *cluster.Cluster
+		kubeClient  kubernetes.Interface
+		resolvedNS  string
+	)
+	if *noKubernetes || (*kubeconfig == "" && os.Getenv("KUBERNETES_SERVICE_HOST") == "") {
+		log.Infow("starting in standalone mode (no kubernetes)")
+		s, err := memory.New(memory.Options{Path: *stateFile})
+		if err != nil {
+			log.Fatalf("memory store: %v", err)
+		}
+		store = s
+	} else {
+		cfg, ns, err := buildKubeConfig(*kubeconfig, *namespace)
+		if err != nil {
+			log.Fatalf("kube config: %v", err)
+		}
+		resolvedNS = ns
+		kubeClient, err = kubernetes.NewForConfig(cfg)
+		if err != nil {
+			log.Fatalf("kube client: %v", err)
+		}
+		s, err := configmap.New(ctx, configmap.Options{
+			Client:    kubeClient,
+			Namespace: resolvedNS,
+			Name:      *stateConfigMap,
+		})
+		if err != nil {
+			log.Fatalf("configmap store: %v", err)
+		}
+		store = s
+		log.Infow("kubernetes mode",
+			"namespace", resolvedNS, "configmap", *stateConfigMap, "lease", *leaderLease)
 	}
-	store, err := crdt.New(crdt.Options{
-		Node:      nodeID,
-		StatePath: *stateFile,
-	})
+
+	// First compile of the effective config (YAML + whatever the
+	// store already holds).
+	initialSnap, err := store.Snapshot(ctx)
 	if err != nil {
-		log.Fatalf("crdt store: %v", err)
+		log.Fatalf("initial snapshot: %v", err)
 	}
-
-	// Quarantine for changes that fail to compile when applied.
-	q := quarantine.New()
-
-	// Build the initial *Config via Merge so even the first load sees
-	// any state that was restored from disk.
-	cfg, err := policy.MergeFromYAML(initialYAML, store.Snapshot())
+	cfg, err := policy.MergeFromYAML(yamlBytes, initialSnap)
 	if err != nil {
 		log.Fatalf("load policy: %v", err)
 	}
@@ -120,7 +146,8 @@ func main() {
 
 	srv := httpserver.New(cfg)
 
-	// Centralised rebuild + atomic swap. Used by every reload trigger.
+	// Centralised rebuild + atomic swap. Used by every reload trigger
+	// (YAML fsnotify, SIGHUP, store watcher, admin write).
 	var rebuildMu sync.Mutex
 	rebuild := func(source string) error {
 		rebuildMu.Lock()
@@ -131,7 +158,12 @@ func main() {
 		yb := yamlBytes
 		yamlMu.RUnlock()
 
-		newCfg, err := policy.MergeFromYAML(yb, store.Snapshot())
+		snap, err := store.Snapshot(ctx)
+		if err != nil {
+			rvmetrics.RebuildErrors.Inc()
+			return fmt.Errorf("snapshot: %w", err)
+		}
+		newCfg, err := policy.MergeFromYAML(yb, snap)
 		if err != nil {
 			rvmetrics.RebuildErrors.Inc()
 			return fmt.Errorf("merge: %w", err)
@@ -147,16 +179,9 @@ func main() {
 			old.Stop()
 		}
 		logLoaded("policy reloaded", *configPath, newCfg, "source", source)
-		// Refresh the quarantine size gauge so /metrics reflects the
-		// outcome of this rebuild attempt.
-		rvmetrics.QuarantineSize.Set(`section="total"`, int64(q.Len()))
 		return nil
 	}
 
-	// Adapt rebuild() for the adminapi.Applier interface. The admin API
-	// already validated the merged Config; we still go through rebuild
-	// so the YAML floor is fresh and the facts lifecycle is owned by
-	// main.
 	applier := &applierFunc{
 		apply: func(_ *policy.Config, source string) error { return rebuild(source) },
 	}
@@ -205,56 +230,47 @@ func main() {
 		}()
 	}
 
-	// Optional cluster.
-	var clusterNode *cluster.Node
-	var clusterAdapter *clusterBroadcastAdapter
-	if *clusterBind != "" || *clusterDNS != "" {
-		bind := *clusterBind
-		if bind == "" {
-			bind = "0.0.0.0:7946"
-		}
-		peers := splitNonEmpty(*clusterPeers)
-		n, err := cluster.New(cluster.Options{
-			NodeName:          nodeID,
-			BindAddr:          bind,
-			AdvertiseAddr:     *clusterAdvertise,
-			Peers:             peers,
-			DiscoveryDNS:      *clusterDNS,
-			DiscoveryInterval: *clusterDNSEvery,
-			Store:             store,
-			OnDeltaApplied: func() {
-				if err := rebuild("gossip"); err != nil {
-					log.Warnw("rebuild after gossip delta failed; quarantining",
-						"err", err.Error())
-				}
-			},
-			OnApplyError: func(d crdt.Delta, err error) {
-				q.Push(d.Section, d.Key, err.Error())
-			},
-		})
+	// Store watcher: trigger a rebuild every time the snapshot
+	// changes (could be us, could be another replica).
+	go func() {
+		ch, err := store.Watch(ctx)
 		if err != nil {
-			log.Fatalf("cluster init: %v", err)
+			log.Errorw("store watch failed", "err", err.Error())
+			return
 		}
-		if err := n.Start(); err != nil {
-			log.Fatalf("cluster start: %v", err)
+		for ev := range ch {
+			if err := rebuild("store"); err != nil {
+				log.Errorw("rebuild after store change failed; keeping previous policy",
+					"revision", string(ev.Revision), "err", err.Error())
+			}
 		}
-		clusterNode = n
-		clusterAdapter = &clusterBroadcastAdapter{node: n}
-		log.Infow("cluster: started", "node", nodeID, "addr", n.LocalAddr())
+	}()
+
+	// Cluster (leader election). Skipped if no kube client.
+	podName := os.Getenv("HOSTNAME")
+	if podName == "" {
+		podName = "rv-local"
+	}
+	adminURL := fmt.Sprintf("http://%s:%d", podName, *adminPort)
+	clusterNode, err = cluster.Bootstrap(ctx, cluster.Options{
+		Client:    kubeClient,
+		Namespace: resolvedNS,
+		LeaseName: *leaderLease,
+		PodName:   podName,
+		AdminURL:  adminURL,
+	})
+	if err != nil {
+		log.Fatalf("cluster bootstrap: %v", err)
 	}
 
-	// Optional admin API.
+	// Admin API (optional).
 	var adminSrv *adminapi.Server
 	if *adminTokenFile != "" {
-		var broadcaster adminapi.Broadcaster
-		if clusterAdapter != nil {
-			broadcaster = clusterAdapter
-		}
 		adminSrv, err = adminapi.New(adminapi.Options{
-			Addr:       fmt.Sprintf(":%d", *adminPort),
-			TokenFile:  *adminTokenFile,
-			Store:      store,
-			Quarantine: q,
+			Addr:      fmt.Sprintf(":%d", *adminPort),
+			TokenFile: *adminTokenFile,
+			Store:     store,
+			Cluster:   clusterNode,
 			YAMLProvider: func() []byte {
 				yamlMu.RLock()
 				defer yamlMu.RUnlock()
@@ -262,8 +278,7 @@ func main() {
 				copy(out, yamlBytes)
 				return out
 			},
-			Broadcaster: broadcaster,
-			Applier:     applier,
+			Applier: applier,
 		})
 		if err != nil {
 			log.Fatalf("admin api init: %v", err)
@@ -296,9 +311,7 @@ func main() {
 		if p := srv.Policy(); p != nil {
 			p.Stop()
 		}
-		if err := store.Close(); err != nil {
-			log.Warnw("crdt store flush failed", "err", err.Error())
-		}
+		_ = store.Close()
 	case err := <-errCh:
 		if err != nil {
 			log.Errorw("server crashed", "err", err.Error())
@@ -314,82 +327,50 @@ func main() {
 	}
 }
 
-// resolveNodeID derives a stable per-replica identifier. It tries, in
-// order: a UUID persisted next to the state file; otherwise a fresh
-// hostname-based one stamped into that directory; otherwise an
-// in-memory random ID for stateless runs.
-func resolveNodeID(stateFile string) (string, error) {
-	host, _ := os.Hostname()
-	if host == "" {
-		host = "rv"
+// buildKubeConfig returns a kube rest.Config plus the namespace to
+// use. Order of preference:
+//
+//  1. --kubeconfig flag if non-empty.
+//  2. In-cluster config (uses the pod's service account).
+//
+// The namespace falls back to /var/run/secrets/.../namespace when
+// running in-cluster, then to the --namespace flag, then to "default".
+func buildKubeConfig(kubeconfigPath, nsOverride string) (*rest.Config, string, error) {
+	if kubeconfigPath != "" {
+		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+		if err != nil {
+			return nil, "", err
+		}
+		ns := nsOverride
+		if ns == "" {
+			ns = "default"
+		}
+		return cfg, ns, nil
 	}
-	if stateFile == "" {
-		return host + "-" + randomHex(4), nil
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, "", err
 	}
-	idFile := filepath.Join(filepath.Dir(stateFile), ".node-id")
-	if b, err := os.ReadFile(idFile); err == nil {
-		id := strings.TrimSpace(string(b))
-		if id != "" {
-			return id, nil
+	ns := nsOverride
+	if ns == "" {
+		if b, rerr := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); rerr == nil {
+			ns = strings.TrimSpace(string(b))
 		}
 	}
-	id := host + "-" + randomHex(4)
-	if err := os.MkdirAll(filepath.Dir(idFile), 0o755); err != nil {
-		return "", err
+	if ns == "" {
+		ns = "default"
 	}
-	if err := os.WriteFile(idFile, []byte(id), 0o644); err != nil {
-		return "", err
-	}
-	return id, nil
+	return cfg, ns, nil
 }
 
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		// Deterministic fallback; collisions are tolerable as a tie-
-		// breaker for a single-process boot.
-		for i := range buf {
-			buf[i] = byte(i)
-		}
-	}
-	return hex.EncodeToString(buf)
-}
-
-func splitNonEmpty(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// applierFunc adapts a closure to adminapi.Applier.
 type applierFunc struct {
-	apply func(newCfg *policy.Config, source string) error
+	apply func(*policy.Config, string) error
 }
 
-func (a *applierFunc) Apply(newCfg *policy.Config, source string) error {
-	return a.apply(newCfg, source)
-}
+func (a *applierFunc) Apply(c *policy.Config, src string) error { return a.apply(c, src) }
 
-// clusterBroadcastAdapter bridges adminapi.Broadcaster to *cluster.Node.
-type clusterBroadcastAdapter struct {
-	node *cluster.Node
-}
-
-func (a *clusterBroadcastAdapter) BroadcastDelta(d crdt.Delta) {
-	a.node.BroadcastDelta(d)
-}
-
-// logLoaded emits a single consistent log line for both the initial load and
-// subsequent reloads. Extra key/value pairs are appended verbatim.
+// logLoaded emits a single consistent log line for both the initial
+// load and subsequent reloads.
 func logLoaded(msg, path string, cfg *policy.Config, extra ...any) {
 	rules := 0
 	for _, g := range cfg.Groups {
@@ -406,10 +387,9 @@ func logLoaded(msg, path string, cfg *policy.Config, extra ...any) {
 	log.Infow(msg, kv...)
 }
 
-// applyLogging rebuilds the global logger from the policy's logging block.
-// The CLI flags --log-level / --log-format override the file values when
-// they are non-empty so an operator can crank up verbosity at runtime
-// without editing the ConfigMap.
+// applyLogging rebuilds the global logger from the policy's logging
+// block. The CLI flags --log-level / --log-format override the file
+// values when non-empty.
 func applyLogging(lg policy.Logging, levelFlag, formatFlag string) {
 	lvl := lg.Level
 	if levelFlag != "" {
@@ -425,5 +405,3 @@ func applyLogging(lg policy.Logging, levelFlag, formatFlag string) {
 			"err", err.Error())
 	}
 }
-
-// silence unused linter when builds disable some paths.

@@ -3,40 +3,38 @@ package adminapi
 import (
 	"encoding/json"
 
-	"request-validator/internal/crdt"
 	"request-validator/internal/facts"
 	"request-validator/internal/policy"
-	"request-validator/internal/quarantine"
+	"request-validator/internal/state"
 )
 
 // dto.go declares every request / response type the admin API exposes
 // so the OpenAPI generator (swaggo/swag v2) can introspect them.
 //
-// Types here are intentionally separate from the internal `policy` /
-// `crdt` types: those are about runtime state (compiled CEL programs,
-// atomic pointers, …) and would not survive JSON marshalling cleanly.
-// The DTOs are a stable wire contract.
+// These types are deliberately separate from the internal runtime
+// types: those carry compiled CEL programs, mutexes and informers
+// that don't survive JSON marshalling cleanly. The DTOs are a stable
+// wire contract.
 
 // ErrorResponse is the JSON shape returned for any non-2xx outcome.
 type ErrorResponse struct {
 	// Error is a short, human-readable explanation.
-	Error string `json:"error" example:"rebuild failed: group \"x\": rules must not be empty"`
+	Error string `json:"error" example:"validation failed: group \"x\": rules must not be empty"`
 }
 
-// ItemResponse is the JSON shape returned for a single CRDT-managed
-// entry in a collection (`groups`, `facts`).
+// ItemResponse is the JSON shape returned for a single overlay entry
+// in a collection (`groups`, `facts`).
 type ItemResponse struct {
 	// Name is the entry key (e.g. group name, fact name).
 	Name string `json:"name" example:"api-block-residential"`
 	// Section is the parent collection ("groups" or "facts").
 	Section string `json:"section" example:"groups"`
-	// Stamp is the LWW timestamp that resolved the last write.
-	Stamp crdt.Stamp `json:"stamp"`
+	// Revision is the opaque concurrency token; pass it back as
+	// `If-Match` to perform a conditional update.
+	Revision state.Revision `json:"revision" example:"42"`
 	// Payload is the JSON payload exactly as it would appear inside
 	// the YAML policy (decoded into a generic object).
 	Payload json.RawMessage `json:"payload" swaggertype:"object"`
-	// Tombstone is true when the entry is a deletion marker.
-	Tombstone bool `json:"tombstone,omitempty" example:"false"`
 }
 
 // ItemListResponse wraps an array of ItemResponse for collection GETs.
@@ -47,9 +45,9 @@ type ItemListResponse struct {
 // RegisterResponse is the JSON shape returned by GET/PUT on the
 // singleton sections (`defaults`, `logging`).
 type RegisterResponse struct {
-	Section string          `json:"section" example:"defaults"`
-	Stamp   crdt.Stamp      `json:"stamp"`
-	Payload json.RawMessage `json:"payload" swaggertype:"object"`
+	Section  string          `json:"section" example:"defaults"`
+	Revision state.Revision  `json:"revision" example:"42"`
+	Payload  json.RawMessage `json:"payload" swaggertype:"object"`
 }
 
 // GroupRequest is the body shape accepted by PUT /api/v1/groups/{name}.
@@ -76,11 +74,11 @@ type RuleRequest struct {
 
 // FactRequest is the body shape accepted by PUT /api/v1/facts/{name}.
 type FactRequest struct {
-	Name   string         `json:"name,omitempty" example:"chatgptFeed"`
-	Method string         `json:"method" example:"url" enums:"value,file,url"`
-	Value  any            `json:"value,omitempty" swaggertype:"object"`
-	File   *FactFileSpec  `json:"file,omitempty"`
-	URL    *FactURLSpec   `json:"url,omitempty"`
+	Name   string        `json:"name,omitempty" example:"chatgptFeed"`
+	Method string        `json:"method" example:"url" enums:"value,file,url"`
+	Value  any           `json:"value,omitempty" swaggertype:"object"`
+	File   *FactFileSpec `json:"file,omitempty"`
+	URL    *FactURLSpec  `json:"url,omitempty"`
 }
 
 // FactFileSpec is the `file:` block of a fact spec.
@@ -140,8 +138,17 @@ type GroupViewElement struct {
 	Rules       []RuleRequest `json:"rules"`
 }
 
-// QuarantineListResponse is the body returned by
-// GET /api/v1/quarantine.
-type QuarantineListResponse struct {
-	Items []quarantine.Entry `json:"items"`
+// ClusterResponse is the body returned by GET /api/v1/cluster.
+type ClusterResponse struct {
+	Standalone bool       `json:"standalone"`
+	IAmLeader  bool       `json:"iAmLeader"`
+	Leader     LeaderView `json:"leader"`
+}
+
+// LeaderView is the nested leader info in ClusterResponse.
+type LeaderView struct {
+	PodName    string `json:"podName"`
+	AdminURL   string `json:"adminURL"`
+	Identity   string `json:"identity"`
+	LeaseUntil string `json:"leaseUntil"`
 }

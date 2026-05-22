@@ -8,6 +8,20 @@ const docTemplate = `{
     "schemes": {{ marshal .Schemes }},
     "components": {
         "schemas": {
+            "adminapi.ClusterResponse": {
+                "properties": {
+                    "iAmLeader": {
+                        "type": "boolean"
+                    },
+                    "leader": {
+                        "$ref": "#/components/schemas/adminapi.LeaderView"
+                    },
+                    "standalone": {
+                        "type": "boolean"
+                    }
+                },
+                "type": "object"
+            },
             "adminapi.ConfigResponse": {
                 "properties": {
                     "defaults": {
@@ -65,7 +79,7 @@ const docTemplate = `{
                 "properties": {
                     "error": {
                         "description": "Error is a short, human-readable explanation.",
-                        "example": "rebuild failed: group \"x\": rules must not be empty",
+                        "example": "validation failed: group \"x\": rules must not be empty",
                         "type": "string"
                     }
                 },
@@ -234,18 +248,32 @@ const docTemplate = `{
                         "description": "Payload is the JSON payload exactly as it would appear inside\nthe YAML policy (decoded into a generic object).",
                         "type": "object"
                     },
+                    "revision": {
+                        "description": "Revision is the opaque concurrency token; pass it back as\n` + "`" + `If-Match` + "`" + ` to perform a conditional update.",
+                        "example": "42",
+                        "type": "string"
+                    },
                     "section": {
                         "description": "Section is the parent collection (\"groups\" or \"facts\").",
                         "example": "groups",
                         "type": "string"
+                    }
+                },
+                "type": "object"
+            },
+            "adminapi.LeaderView": {
+                "properties": {
+                    "adminURL": {
+                        "type": "string"
                     },
-                    "stamp": {
-                        "$ref": "#/components/schemas/crdt.Stamp"
+                    "identity": {
+                        "type": "string"
                     },
-                    "tombstone": {
-                        "description": "Tombstone is true when the entry is a deletion marker.",
-                        "example": false,
-                        "type": "boolean"
+                    "leaseUntil": {
+                        "type": "string"
+                    },
+                    "podName": {
+                        "type": "string"
                     }
                 },
                 "type": "object"
@@ -301,29 +329,18 @@ const docTemplate = `{
                 },
                 "type": "object"
             },
-            "adminapi.QuarantineListResponse": {
-                "properties": {
-                    "items": {
-                        "items": {
-                            "$ref": "#/components/schemas/quarantine.Entry"
-                        },
-                        "type": "array",
-                        "uniqueItems": false
-                    }
-                },
-                "type": "object"
-            },
             "adminapi.RegisterResponse": {
                 "properties": {
                     "payload": {
                         "type": "object"
                     },
+                    "revision": {
+                        "example": "42",
+                        "type": "string"
+                    },
                     "section": {
                         "example": "defaults",
                         "type": "string"
-                    },
-                    "stamp": {
-                        "$ref": "#/components/schemas/crdt.Stamp"
                     }
                 },
                 "type": "object"
@@ -364,18 +381,6 @@ const docTemplate = `{
                 },
                 "type": "object"
             },
-            "crdt.Stamp": {
-                "description": "Stamp is the LWW timestamp that resolved the last write.",
-                "properties": {
-                    "node": {
-                        "type": "string"
-                    },
-                    "ts": {
-                        "type": "integer"
-                    }
-                },
-                "type": "object"
-            },
             "facts.Spec": {
                 "type": "object"
             },
@@ -383,29 +388,6 @@ const docTemplate = `{
                 "type": "object"
             },
             "policy.Logging": {
-                "type": "object"
-            },
-            "quarantine.Entry": {
-                "properties": {
-                    "key": {
-                        "type": "string"
-                    },
-                    "lastRetry": {
-                        "type": "string"
-                    },
-                    "reason": {
-                        "type": "string"
-                    },
-                    "retryCount": {
-                        "type": "integer"
-                    },
-                    "section": {
-                        "type": "string"
-                    },
-                    "since": {
-                        "type": "string"
-                    }
-                },
                 "type": "object"
             }
         },
@@ -428,9 +410,45 @@ const docTemplate = `{
         "url": ""
     },
     "paths": {
+        "/api/v1/cluster": {
+            "get": {
+                "description": "Returns whether this replica is currently the leader, the leader's admin URL (for client-side redirects), and whether the daemon runs in standalone mode.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ClusterResponse"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    }
+                },
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "summary": "Cluster status and leader info",
+                "tags": [
+                    "cluster"
+                ]
+            }
+        },
         "/api/v1/config": {
             "get": {
-                "description": "Returns the policy the engine would evaluate right now (YAML floor + CRDT overrides), with sources annotated per group.",
+                "description": "Returns the policy the engine would evaluate right now (YAML floor + admin overrides), with sources annotated per group.",
                 "responses": {
                     "200": {
                         "content": {
@@ -481,6 +499,9 @@ const docTemplate = `{
                     "204": {
                         "description": "No Content"
                     },
+                    "307": {
+                        "description": "this replica is not the leader"
+                    },
                     "401": {
                         "content": {
                             "application/json": {
@@ -490,6 +511,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Unauthorized"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Service Unavailable"
                     }
                 },
                 "security": [
@@ -497,7 +528,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "Clear the defaults overlay",
+                "summary": "Clear the defaults overlay (leader-only)",
                 "tags": [
                     "defaults"
                 ]
@@ -579,6 +610,9 @@ const docTemplate = `{
                         },
                         "description": "OK"
                     },
+                    "307": {
+                        "description": "this replica is not the leader"
+                    },
                     "400": {
                         "content": {
                             "application/json": {
@@ -598,6 +632,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Unauthorized"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Service Unavailable"
                     }
                 },
                 "security": [
@@ -605,7 +649,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "Override the defaults block",
+                "summary": "Override the defaults block (leader-only)",
                 "tags": [
                     "defaults"
                 ]
@@ -640,7 +684,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "List CRDT-managed facts",
+                "summary": "List overlay-managed facts",
                 "tags": [
                     "facts"
                 ]
@@ -671,6 +715,9 @@ const docTemplate = `{
                     "204": {
                         "description": "deleted"
                     },
+                    "307": {
+                        "description": "this replica is not the leader"
+                    },
                     "401": {
                         "content": {
                             "application/json": {
@@ -690,6 +737,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Precondition Failed"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Service Unavailable"
                     }
                 },
                 "security": [
@@ -697,7 +754,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "Delete a fact",
+                "summary": "Delete a fact (leader-only)",
                 "tags": [
                     "facts"
                 ]
@@ -757,7 +814,7 @@ const docTemplate = `{
                 ]
             },
             "put": {
-                "description": "Same semantics as a YAML facts entry. URL facts spin up a fetcher on the next rebuild; the previous fetcher (if any) is stopped first.",
+                "description": "URL facts spin up a fetcher on the next rebuild; the previous fetcher (if any) is stopped first. Leader-only.",
                 "parameters": [
                     {
                         "description": "fact name",
@@ -808,6 +865,9 @@ const docTemplate = `{
                         },
                         "description": "OK"
                     },
+                    "307": {
+                        "description": "this replica is not the leader"
+                    },
                     "400": {
                         "content": {
                             "application/json": {
@@ -837,6 +897,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Precondition Failed"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Service Unavailable"
                     }
                 },
                 "security": [
@@ -852,7 +922,7 @@ const docTemplate = `{
         },
         "/api/v1/groups": {
             "get": {
-                "description": "Returns every group currently held in the CRDT store on this node. YAML-only groups are NOT included; use GET /api/v1/config for the merged effective view.",
+                "description": "Returns every group currently held in the replicated state on this node. YAML-only groups are NOT included; use GET /api/v1/config for the merged effective view.",
                 "responses": {
                     "200": {
                         "content": {
@@ -880,7 +950,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "List CRDT-managed groups",
+                "summary": "List overlay-managed groups",
                 "tags": [
                     "groups"
                 ]
@@ -888,7 +958,7 @@ const docTemplate = `{
         },
         "/api/v1/groups/{name}": {
             "delete": {
-                "description": "Writes a tombstone. If a YAML group with the same name exists, it is hidden by the tombstone until the YAML entry is also removed.",
+                "description": "Removes the overlay entry; if a YAML group with the same name exists, the YAML one becomes the effective group again.",
                 "parameters": [
                     {
                         "description": "group name",
@@ -912,6 +982,9 @@ const docTemplate = `{
                     "204": {
                         "description": "deleted"
                     },
+                    "307": {
+                        "description": "this replica is not the leader; follow the Location header"
+                    },
                     "401": {
                         "content": {
                             "application/json": {
@@ -930,7 +1003,17 @@ const docTemplate = `{
                                 }
                             }
                         },
-                        "description": "If-Match did not match the live stamp"
+                        "description": "If-Match did not match the live revision"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "no leader currently elected"
                     }
                 },
                 "security": [
@@ -967,7 +1050,7 @@ const docTemplate = `{
                         "description": "OK",
                         "headers": {
                             "Etag": {
-                                "description": "opaque concurrency token (\\\"\u003cts\u003e-\u003cnode\u003e\\\")",
+                                "description": "opaque concurrency token",
                                 "schema": {
                                     "type": "string"
                                 }
@@ -1000,13 +1083,13 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "Get a single CRDT-managed group",
+                "summary": "Get a single overlay-managed group",
                 "tags": [
                     "groups"
                 ]
             },
             "put": {
-                "description": "Replaces the group with the given name. The whole effective config is recompiled; if validation fails the live policy is untouched and the offending entry is pushed to the local quarantine.",
+                "description": "Only the cluster leader accepts writes; followers reply with 307 Temporary Redirect to the leader. The entire effective config is recompiled before persisting; on validation failure the live policy is untouched and the change is rejected with 400.",
                 "parameters": [
                     {
                         "description": "group name (must match body.name when present)",
@@ -1065,6 +1148,9 @@ const docTemplate = `{
                             }
                         }
                     },
+                    "307": {
+                        "description": "this replica is not the leader; follow the Location header"
+                    },
                     "400": {
                         "content": {
                             "application/json": {
@@ -1073,7 +1159,7 @@ const docTemplate = `{
                                 }
                             }
                         },
-                        "description": "validation/compile failed; entry quarantined"
+                        "description": "validation/compile failed"
                     },
                     "401": {
                         "content": {
@@ -1093,7 +1179,17 @@ const docTemplate = `{
                                 }
                             }
                         },
-                        "description": "If-Match did not match the live stamp"
+                        "description": "If-Match did not match the live revision"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "no leader currently elected"
                     }
                 },
                 "security": [
@@ -1113,6 +1209,9 @@ const docTemplate = `{
                     "204": {
                         "description": "No Content"
                     },
+                    "307": {
+                        "description": "this replica is not the leader"
+                    },
                     "401": {
                         "content": {
                             "application/json": {
@@ -1122,6 +1221,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Unauthorized"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Service Unavailable"
                     }
                 },
                 "security": [
@@ -1129,7 +1238,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "Clear the logging overlay",
+                "summary": "Clear the logging overlay (leader-only)",
                 "tags": [
                     "logging"
                 ]
@@ -1209,6 +1318,9 @@ const docTemplate = `{
                         },
                         "description": "OK"
                     },
+                    "307": {
+                        "description": "this replica is not the leader"
+                    },
                     "400": {
                         "content": {
                             "application/json": {
@@ -1228,6 +1340,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Unauthorized"
+                    },
+                    "503": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
+                                }
+                            }
+                        },
+                        "description": "Service Unavailable"
                     }
                 },
                 "security": [
@@ -1235,7 +1357,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "summary": "Override the logging block",
+                "summary": "Override the logging block (leader-only)",
                 "tags": [
                     "logging"
                 ]
@@ -1277,100 +1399,6 @@ const docTemplate = `{
                     "meta"
                 ]
             }
-        },
-        "/api/v1/quarantine": {
-            "get": {
-                "description": "Per-node view: each replica may legitimately quarantine different items depending on its current state. Items are re-evaluated on every rebuild.",
-                "responses": {
-                    "200": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/adminapi.QuarantineListResponse"
-                                }
-                            }
-                        },
-                        "description": "OK"
-                    },
-                    "401": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
-                                }
-                            }
-                        },
-                        "description": "Unauthorized"
-                    }
-                },
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "summary": "List quarantined CRDT entries",
-                "tags": [
-                    "quarantine"
-                ]
-            }
-        },
-        "/api/v1/quarantine/{section}/{name}": {
-            "delete": {
-                "description": "The CRDT entry itself is NOT removed (it remains the source of truth); only the local quarantine buffer is cleared for this key.",
-                "parameters": [
-                    {
-                        "description": "groups|facts|defaults|logging",
-                        "in": "path",
-                        "name": "section",
-                        "required": true,
-                        "schema": {
-                            "type": "string"
-                        }
-                    },
-                    {
-                        "description": "key name (empty for singleton sections)",
-                        "in": "path",
-                        "name": "name",
-                        "schema": {
-                            "type": "string"
-                        }
-                    }
-                ],
-                "responses": {
-                    "204": {
-                        "description": "No Content"
-                    },
-                    "401": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
-                                }
-                            }
-                        },
-                        "description": "Unauthorized"
-                    },
-                    "404": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/adminapi.ErrorResponse"
-                                }
-                            }
-                        },
-                        "description": "Not Found"
-                    }
-                },
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "summary": "Drop a quarantined entry without retry",
-                "tags": [
-                    "quarantine"
-                ]
-            }
         }
     },
     "openapi": "3.1.0",
@@ -1385,7 +1413,7 @@ const docTemplate = `{
 var SwaggerInfo = &swag.Spec{
 	Version:          "v1",
 	Title:            "request-validator admin API",
-	Description:      "CRUD over the CRDT-backed sections of the policy: groups, facts, defaults, logging. The YAML loaded at boot is the floor; admin writes overlay it per-key and are gossiped to peer replicas. Every write rebuilds the effective config and either applies it atomically or quarantines the offending entry.",
+	Description:      "CRUD over the overlay sections of the policy (groups, facts, defaults, logging). The YAML loaded at boot is the floor; admin writes overlay it per-key and are replicated to peer replicas via a Kubernetes ConfigMap + Lease.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

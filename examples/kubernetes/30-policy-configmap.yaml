@@ -1,0 +1,29 @@
+# Policy file consumed at boot and reloaded on change (fsnotify).
+#
+# Edit this ConfigMap when you want to change the declarative floor
+# of your policy. Admin API overrides (kept in
+# request-validator-state) are layered on top of this; deleting an
+# override returns to whatever this file declares for the same key.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: request-validator-policy
+  namespace: request-validator
+data:
+  policy.yaml: |
+    defaults:
+      action: deny
+      denyStatus: 403
+      denyBody: "Forbidden"
+    logging:
+      level: info
+      format: json
+    groups:
+      # Replace this with rules that match your real protected paths.
+      # Keeping a single deny-by-default placeholder makes "did the
+      # daemon even arrive on this request?" trivial to verify.
+      - name: example
+        action: deny
+        rules:
+          - name: never
+            match: "false"

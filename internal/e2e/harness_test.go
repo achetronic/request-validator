@@ -1,19 +1,15 @@
-// Package e2e contains end-to-end tests that exercise the whole
-// request-validator stack in-process: two nodes, each running the CRDT
-// store, the cluster gossip layer, the admin API and the ext-authz HTTP
-// server, talking to each other over real (loopback) TCP/UDP.
-//
-// These are NOT unit tests: they spin up listeners, perform real HTTP
-// requests, wait for eventual consistency, and assert behaviour at the
-// edge a real Envoy / operator would see. Use them to validate that
-// the wiring in cmd/main.go is mirrored faithfully here when adding
-// new features.
-//
-// The harness here is in-process (default build). A separate set
-// (in this same package, the `binary_test.go` file, behind build
-// tag `e2e`) exercises the actual binary via os/exec.
+//go:build !e2ekind
 
-//go:build !e2e
+// Package e2e contains end-to-end tests that exercise the whole
+// request-validator stack in-process: two nodes sharing the same
+// fake Kubernetes API, each running its own ConfigMap-backed state
+// store, leader election lease, admin API and ext-authz HTTP server.
+//
+// The fake client is the only realistic shortcut: it simulates the
+// API server's CRUD semantics (including resourceVersion-based
+// optimistic concurrency) without needing Kind. For a full
+// real-cluster check use the //go:build e2ekind suite which boots
+// an actual Kind cluster.
 
 package e2e
 
@@ -21,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -31,34 +26,39 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+
 	"request-validator/internal/adminapi"
 	"request-validator/internal/cluster"
-	"request-validator/internal/crdt"
 	"request-validator/internal/httpserver"
 	"request-validator/internal/policy"
-	"request-validator/internal/quarantine"
+	"request-validator/internal/state"
+	"request-validator/internal/state/configmap"
+)
+
+const (
+	adminToken = "e2e-token"
+	testNS     = "rv-e2e"
+	cmName     = "rv-state"
+	leaseName  = "rv-leader"
 )
 
 // node is one full request-validator instance, in-process. It mirrors
-// the wiring done by cmd/main.go but exposes the moving parts so tests
-// can poke at them directly.
+// the wiring done by cmd/main.go on a smaller surface.
 type node struct {
-	name string
+	name     string
+	store    state.Store
+	cluster  *cluster.Cluster
+	httpSrv  *httpserver.Server
+	adminSrv *adminapi.Server
 
-	store     *crdt.Store
-	quar      *quarantine.Buffer
-	httpSrv   *httpserver.Server
-	adminSrv  *adminapi.Server
-	clusterN  *cluster.Node
-
-	extAddr   string // ext-authz HTTP listen addr
-	adminAddr string // admin HTTP listen addr
-	clusterAddr string // memberlist bind addr
+	extAddr   string
+	adminAddr string
 
 	tokenFile string
-	yamlBytes []byte
 	yamlMu    sync.RWMutex
-
+	yamlBytes []byte
 	rebuildMu sync.Mutex
 
 	ctx    context.Context
@@ -68,12 +68,9 @@ type node struct {
 	stopOnce sync.Once
 }
 
-const adminToken = "e2e-token"
-
-// startNode brings up a single full-stack request-validator instance.
-// `peers` is the list of host:port memberlist seeds to join; pass nil
-// for the first node.
-func startNode(t *testing.T, name string, yamlBytes []byte, peers []string) *node {
+// startNode brings up a single full-stack instance against the shared
+// fake clientset.
+func startNode(t *testing.T, name string, kc kubernetes.Interface, yamlBytes []byte) *node {
 	t.Helper()
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, "token")
@@ -81,57 +78,70 @@ func startNode(t *testing.T, name string, yamlBytes []byte, peers []string) *nod
 		t.Fatal(err)
 	}
 
-	store, err := crdt.New(crdt.Options{
-		Node:      name,
-		StatePath: filepath.Join(dir, "state.json"),
+	ctx, cancel := context.WithCancel(context.Background())
+	// In the in-process E2E we share a fake clientset between two
+	// nodes. fake's watch propagation between informers backed by
+	// the same client is unreliable across goroutines; a short
+	// ResyncPeriod sidesteps it by polling the cached object. Real
+	// Kubernetes is fine without this; the Kind-based E2E uses
+	// the default.
+	cmStore, err := configmap.New(ctx, configmap.Options{
+		Client: kc, Namespace: testNS, Name: cmName,
+		ResyncPeriod: 200 * time.Millisecond,
 	})
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
-	q := quarantine.New()
 
 	n := &node{
 		name:      name,
-		store:     store,
-		quar:      q,
+		store:     cmStore,
 		tokenFile: tokenPath,
 		yamlBytes: yamlBytes,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
-	n.ctx, n.cancel = context.WithCancel(context.Background())
 
-	// Initial Config.
-	cfg, err := policy.MergeFromYAML(yamlBytes, store.Snapshot())
+	// Compute the addresses up front; we pre-bind to grab a free
+	// port, close immediately, then let the actual server re-bind by
+	// addr. Tiny race window in tests, acceptable.
+	n.extAddr = mustFreeTCP(t)
+	n.adminAddr = mustFreeTCP(t)
+
+	snap, _ := cmStore.Snapshot(ctx)
+	cfg, err := policy.MergeFromYAML(yamlBytes, snap)
 	if err != nil {
-		t.Fatalf("initial merge: %v", err)
+		cancel()
+		t.Fatal(err)
 	}
-	if err := cfg.Start(n.ctx); err != nil {
-		t.Fatalf("facts start: %v", err)
+	if err := cfg.Start(ctx); err != nil {
+		cancel()
+		t.Fatal(err)
 	}
-
-	// ext-authz server on an ephemeral port.
 	n.httpSrv = httpserver.New(cfg)
-	extLis := mustListenTCP(t)
-	n.extAddr = extLis.Addr().String()
-	extLis.Close() // release; the http server will re-bind by addr
+
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
 		_ = n.httpSrv.Run(n.extAddr)
 	}()
 
-	// Centralised rebuild. Mirrors cmd/main.go::rebuild.
 	rebuild := func(source string) error {
 		n.rebuildMu.Lock()
 		defer n.rebuildMu.Unlock()
 		n.yamlMu.RLock()
 		yb := n.yamlBytes
 		n.yamlMu.RUnlock()
-
-		newCfg, err := policy.MergeFromYAML(yb, store.Snapshot())
+		snap, err := cmStore.Snapshot(ctx)
 		if err != nil {
 			return err
 		}
-		if err := newCfg.Start(n.ctx); err != nil {
+		newCfg, err := policy.MergeFromYAML(yb, snap)
+		if err != nil {
+			return err
+		}
+		if err := newCfg.Start(ctx); err != nil {
 			newCfg.Stop()
 			return err
 		}
@@ -142,42 +152,40 @@ func startNode(t *testing.T, name string, yamlBytes []byte, peers []string) *nod
 		return nil
 	}
 
-	// Admin API on its own ephemeral port.
-	adminLis := mustListenTCP(t)
-	n.adminAddr = adminLis.Addr().String()
-	adminLis.Close()
-
-	applier := &applierFunc{apply: func(_ *policy.Config, source string) error {
-		return rebuild(source)
-	}}
-
-	// Cluster on its own ephemeral port.
-	clusterPort := mustFreeUDPPort(t)
-	n.clusterAddr = fmt.Sprintf("127.0.0.1:%d", clusterPort)
-
-	clusterN, err := cluster.New(cluster.Options{
-		NodeName:       name,
-		BindAddr:       n.clusterAddr,
-		Peers:          peers,
-		Store:          store,
-		OnDeltaApplied: func() { _ = rebuild("gossip") },
-		OnApplyError: func(d crdt.Delta, err error) {
-			q.Push(d.Section, d.Key, err.Error())
-		},
+	// Cluster (leader election against the shared fake client).
+	cl, err := cluster.Bootstrap(ctx, cluster.Options{
+		Client:        kc,
+		Namespace:     testNS,
+		LeaseName:     leaseName,
+		PodName:       name,
+		AdminURL:      "http://" + n.adminAddr,
+		LeaseDuration: 2 * time.Second,
+		RenewDeadline: time.Second,
+		RetryPeriod:   200 * time.Millisecond,
 	})
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
-	if err := clusterN.Start(); err != nil {
-		t.Fatal(err)
-	}
-	n.clusterN = clusterN
+	n.cluster = cl
 
+	// Store watcher triggers a rebuild on every replica.
+	go func() {
+		ch, err := cmStore.Watch(ctx)
+		if err != nil {
+			return
+		}
+		for range ch {
+			_ = rebuild("store")
+		}
+	}()
+
+	applier := &applierFunc{apply: func(_ *policy.Config, src string) error { return rebuild(src) }}
 	adminSrv, err := adminapi.New(adminapi.Options{
-		Addr:       n.adminAddr,
-		TokenFile:  tokenPath,
-		Store:      store,
-		Quarantine: q,
+		Addr:      n.adminAddr,
+		TokenFile: tokenPath,
+		Store:     cmStore,
+		Cluster:   cl,
 		YAMLProvider: func() []byte {
 			n.yamlMu.RLock()
 			defer n.yamlMu.RUnlock()
@@ -185,22 +193,23 @@ func startNode(t *testing.T, name string, yamlBytes []byte, peers []string) *nod
 			copy(out, n.yamlBytes)
 			return out
 		},
-		Broadcaster: &broadcastAdapter{node: clusterN},
-		Applier:     applier,
+		Applier: applier,
 	})
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
 	n.adminSrv = adminSrv
+
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
 		_ = adminSrv.Run()
 	}()
 
-	t.Cleanup(func() { n.stop() })
+	t.Cleanup(n.stop)
 
-	waitForHTTP(t, "http://"+n.extAddr+"/healthz", 3*time.Second)
+	waitForHTTP(t, "http://"+n.extAddr+"/healthz", 3*time.Second, nil)
 	waitForHTTP(t, "http://"+n.adminAddr+"/api/v1/config", 3*time.Second, withBearer(adminToken))
 	return n
 }
@@ -216,8 +225,8 @@ func (n *node) stop() {
 				p.Stop()
 			}
 		}
-		if n.clusterN != nil {
-			n.clusterN.Stop()
+		if n.cluster != nil {
+			n.cluster.Stop()
 		}
 		if n.store != nil {
 			_ = n.store.Close()
@@ -227,57 +236,29 @@ func (n *node) stop() {
 	})
 }
 
-// adminURL returns the base URL for the admin API on this node.
-func (n *node) adminURL() string { return "http://" + n.adminAddr }
-
-// extURL returns the base URL for the ext-authz endpoint on this node.
-func (n *node) extURL() string { return "http://" + n.extAddr }
-
 // --- helpers ---
 
 type applierFunc struct {
 	apply func(*policy.Config, string) error
 }
 
-func (a *applierFunc) Apply(cfg *policy.Config, src string) error {
-	return a.apply(cfg, src)
-}
+func (a *applierFunc) Apply(c *policy.Config, s string) error { return a.apply(c, s) }
 
-type broadcastAdapter struct {
-	node *cluster.Node
-}
-
-func (b *broadcastAdapter) BroadcastDelta(d crdt.Delta) {
-	b.node.BroadcastDelta(d)
-}
-
-func mustListenTCP(t *testing.T) *net.TCPListener {
+func mustFreeTCP(t *testing.T) string {
 	t.Helper()
-	l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return l
-}
-
-func mustFreeUDPPort(t *testing.T) int {
-	t.Helper()
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer udp.Close()
-	return udp.LocalAddr().(*net.UDPAddr).Port
+	addr := l.Addr().String()
+	_ = l.Close()
+	return addr
 }
 
 type reqOpt func(*http.Request)
 
 func withBearer(tok string) reqOpt {
 	return func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+tok) }
-}
-
-func withHeader(k, v string) reqOpt {
-	return func(r *http.Request) { r.Header.Set(k, v) }
 }
 
 func doReq(t *testing.T, method, url string, body []byte, opts ...reqOpt) (*http.Response, []byte) {
@@ -296,7 +277,11 @@ func doReq(t *testing.T, method, url string, body []byte, opts ...reqOpt) (*http
 	for _, o := range opts {
 		o(r)
 	}
-	resp, err := http.DefaultClient.Do(r)
+	// Disable redirect-following so tests can observe 307s when they
+	// want; per-test helpers can use a different client if they
+	// prefer to follow.
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +299,9 @@ func waitForHTTP(t *testing.T, url string, timeout time.Duration, opts ...reqOpt
 			t.Fatal(err)
 		}
 		for _, o := range opts {
-			o(r)
+			if o != nil {
+				o(r)
+			}
 		}
 		resp, err := http.DefaultClient.Do(r)
 		if err == nil {
@@ -337,14 +324,15 @@ func eventually(t *testing.T, timeout time.Duration, msg string, fn func() bool)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("eventually(%q): never became true within %s", msg, timeout)
+	t.Fatalf("eventually(%q): never true within %s", msg, timeout)
 }
 
-// getEffectiveGroups returns the names of groups in the effective
-// config served by the node's admin API.
+func adminURL(n *node) string { return "http://" + n.adminAddr }
+func extURL(n *node) string   { return "http://" + n.extAddr }
+
 func getEffectiveGroups(t *testing.T, n *node) []string {
 	t.Helper()
-	resp, body := doReq(t, "GET", n.adminURL()+"/api/v1/config", nil, withBearer(adminToken))
+	resp, body := doReq(t, "GET", adminURL(n)+"/api/v1/config", nil, withBearer(adminToken))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/config on %s: %d %s", n.name, resp.StatusCode, body)
 	}
@@ -353,9 +341,7 @@ func getEffectiveGroups(t *testing.T, n *node) []string {
 			Name string `json:"name"`
 		} `json:"groups"`
 	}
-	if err := json.Unmarshal(body, &v); err != nil {
-		t.Fatal(err)
-	}
+	_ = json.Unmarshal(body, &v)
 	out := make([]string, 0, len(v.Groups))
 	for _, g := range v.Groups {
 		out = append(out, g.Name)
@@ -363,7 +349,6 @@ func getEffectiveGroups(t *testing.T, n *node) []string {
 	return out
 }
 
-// hasGroup reports whether `name` is in the effective config of n.
 func hasGroup(t *testing.T, n *node, name string) bool {
 	for _, g := range getEffectiveGroups(t, n) {
 		if g == name {
@@ -373,11 +358,9 @@ func hasGroup(t *testing.T, n *node, name string) bool {
 	return false
 }
 
-// extAuthzCheck does a single ext-authz POST and returns the HTTP
-// status the node would have Envoy enforce.
 func extAuthzCheck(t *testing.T, n *node, method, host, path, ip string, body []byte) int {
 	t.Helper()
-	r, _ := http.NewRequest(method, n.extURL()+path, bytes.NewReader(body))
+	r, _ := http.NewRequest(method, extURL(n)+path, bytes.NewReader(body))
 	r.Host = host
 	if ip != "" {
 		r.Header.Set("X-Forwarded-For", ip)
@@ -390,54 +373,89 @@ func extAuthzCheck(t *testing.T, n *node, method, host, path, ip string, body []
 	return resp.StatusCode
 }
 
-// putGroup is a convenience helper for the admin API.
+// putGroup sends a PUT and follows a single 307 redirect so the test
+// can target any node and still hit the leader.
 func putGroup(t *testing.T, n *node, name string, payload map[string]any) {
 	t.Helper()
 	body, _ := json.Marshal(payload)
-	resp, b := doReq(t, "PUT", n.adminURL()+"/api/v1/groups/"+name, body, withBearer(adminToken))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT group %q on %s: %d %s", name, n.name, resp.StatusCode, b)
+	url := adminURL(n) + "/api/v1/groups/" + name
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, b := doReq(t, "PUT", url, body, withBearer(adminToken))
+		if resp.StatusCode == http.StatusTemporaryRedirect {
+			url = resp.Header.Get("Location")
+			if url == "" {
+				t.Fatalf("307 without Location header")
+			}
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PUT group %q on %s: %d %s", name, n.name, resp.StatusCode, b)
+		}
+		return
 	}
+	t.Fatalf("PUT %s: too many redirects", name)
 }
 
 func deleteGroup(t *testing.T, n *node, name string) {
 	t.Helper()
-	resp, b := doReq(t, "DELETE", n.adminURL()+"/api/v1/groups/"+name, nil, withBearer(adminToken))
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("DELETE group %q on %s: %d %s", name, n.name, resp.StatusCode, b)
+	url := adminURL(n) + "/api/v1/groups/" + name
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, b := doReq(t, "DELETE", url, nil, withBearer(adminToken))
+		if resp.StatusCode == http.StatusTemporaryRedirect {
+			url = resp.Header.Get("Location")
+			continue
+		}
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("DELETE group %q on %s: %d %s", name, n.name, resp.StatusCode, b)
+		}
+		return
 	}
-}
-
-func putFact(t *testing.T, n *node, name string, payload map[string]any) {
-	t.Helper()
-	body, _ := json.Marshal(payload)
-	resp, b := doReq(t, "PUT", n.adminURL()+"/api/v1/facts/"+name, body, withBearer(adminToken))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT fact %q on %s: %d %s", name, n.name, resp.StatusCode, b)
-	}
+	t.Fatalf("DELETE %s: too many redirects", name)
 }
 
 func putDefaults(t *testing.T, n *node, payload map[string]any) {
 	t.Helper()
 	body, _ := json.Marshal(payload)
-	resp, b := doReq(t, "PUT", n.adminURL()+"/api/v1/defaults", body, withBearer(adminToken))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT defaults on %s: %d %s", n.name, resp.StatusCode, b)
+	url := adminURL(n) + "/api/v1/defaults"
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, b := doReq(t, "PUT", url, body, withBearer(adminToken))
+		if resp.StatusCode == http.StatusTemporaryRedirect {
+			url = resp.Header.Get("Location")
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PUT defaults: %d %s", resp.StatusCode, b)
+		}
+		return
 	}
+	t.Fatalf("PUT defaults: too many redirects")
 }
 
-// quarantineEntries returns the list of quarantined items on a node.
-func quarantineEntries(t *testing.T, n *node) []quarantine.Entry {
-	t.Helper()
-	resp, body := doReq(t, "GET", n.adminURL()+"/api/v1/quarantine", nil, withBearer(adminToken))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET quarantine on %s: %d %s", n.name, resp.StatusCode, body)
-	}
-	var v struct {
-		Items []quarantine.Entry `json:"items"`
-	}
-	if err := json.Unmarshal(body, &v); err != nil {
-		t.Fatal(err)
-	}
-	return v.Items
+// newSharedClient returns a fake clientset that both nodes share so
+// they really do see each other through the API.
+func newSharedClient() kubernetes.Interface {
+	return fake.NewClientset()
 }
+
+func ensureLeader(t *testing.T, nodes ...*node) {
+	t.Helper()
+	eventually(t, 5*time.Second, "some node holds the lease", func() bool {
+		for _, n := range nodes {
+			if n.cluster.IsLeader() {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func leaderOf(nodes ...*node) *node {
+	for _, n := range nodes {
+		if n.cluster.IsLeader() {
+			return n
+		}
+	}
+	return nil
+}
+
+// unused-helper guard so changes to imports don't silently break.

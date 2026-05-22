@@ -137,28 +137,33 @@ only lists the points where we have a house preference or a hard rule.
 - **No** admin endpoints on the ext-authz port. The CRUD API lives on
   its own listener; mixing them defeats the auth model.
 
-## Cluster, CRDT and admin API
+## State, cluster and admin API
 
-When touching `internal/{cluster,crdt,adminapi,quarantine}`:
+When touching `internal/{state,cluster,adminapi}`:
 
-- **CRDT data types stay pure**: `LWWMap` and `LWWRegister` know
-  nothing about HTTP, gossip or `policy`. They expose `Put`, `Delete`,
-  `Get`, `Snapshot`, `Merge`. Anything richer goes in a wrapper.
-- **Persistence is the store's job**, not the cluster's: `crdt.Store`
-  owns the JSON file. `cluster` only transports diffs.
-- **Every CRDT mutation routes through `policy.Merge + Compile`**: do
-  not skip validation for "trusted" inputs. The validator is the only
-  thing keeping the live `*Config` safe.
-- **Admin API handlers are thin**: parse → call into `crdt.Store` /
-  `policy.Merge` → respond. Business logic stays out of HTTP handlers.
-- **Auth is centralised in middleware**: every admin handler is wrapped
-  by `requireBearer`; never check the token inline.
-- **Gossip messages are versioned**: every payload starts with a `v`
-  byte (or a typed envelope). Unknown versions are dropped with a
-  `WARN` log so future bumps stay backwards-compatible.
-- **Node IDs are stable**: derive from hostname + a persisted UUID in
-  the state file. Never randomise on every boot — it breaks LWW
-  tiebreaking after restarts.
-- **Tests for replicated logic** spin up 2-3 in-process memberlist
-  nodes on loopback ports and assert eventual convergence with a
-  polling helper (see `TESTING.md`). No real cluster tests; no docker.
+- **`state.Store` is the only contract the rest of the code knows**.
+  Both backends (`memory` and `configmap`) implement the same
+  interface; new backends should follow it without leaking
+  Kubernetes / filesystem details to the admin API.
+- **Reads from the hot path use cached snapshots, not the API
+  server**: `Store.Snapshot()` returns the informer's view (for
+  the ConfigMap backend) so per-request cost stays O(1) lookups.
+- **Every store mutation routes through `policy.MergeFromYAML +
+  Compile`**: never skip validation for "trusted" inputs. The
+  validator is the only thing keeping the live `*Config` safe. The
+  admin API validates against a *hypothetical* snapshot before
+  committing to the real store.
+- **Admin API handlers are thin**: parse → leader check (or 307) →
+  validate → `state.Store.Put/Delete` → rebuild. Business logic
+  stays out of HTTP handlers.
+- **Auth is centralised in middleware**: every admin handler is
+  wrapped by `requireBearer`; never check the token inline.
+- **The cluster package depends only on `client-go`**. Do not pull
+  the kube types into other packages; introduce a small wrapper
+  type if you need to expose new state.
+- **Followers serve reads, never writes**. New write endpoints must
+  call `ensureLeaderOrRedirect` before mutating the store.
+- **Tests for replicated logic** spin up two in-process nodes
+  sharing a fake clientset and assert eventual convergence with a
+  polling helper (see `TESTING.md`). Full-cluster verification
+  uses `make e2e-kind`.

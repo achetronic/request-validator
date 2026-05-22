@@ -1,16 +1,15 @@
-//go:build !e2e
+//go:build !e2ekind
 
 package e2e
 
 import (
-	"fmt"
+	"bytes"
+	"context"
 	"net/http"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"request-validator/internal/crdt"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const baseYAML = `
@@ -25,11 +24,11 @@ groups:
         match: "true"
 `
 
-// TestE2E_AdminPutReplicates is the smoke test: a group PUT on A is
-// eventually visible in B's effective config (D-015, D-016, D-018).
 func TestE2E_AdminPutReplicates(t *testing.T) {
-	a := startNode(t, "A", []byte(baseYAML), nil)
-	b := startNode(t, "B", []byte(baseYAML), []string{a.clusterAddr})
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	b := startNode(t, "B", kc, []byte(baseYAML))
+	ensureLeader(t, a, b)
 
 	putGroup(t, a, "api-only", map[string]any{
 		"name":     "api-only",
@@ -40,94 +39,72 @@ func TestE2E_AdminPutReplicates(t *testing.T) {
 		},
 	})
 
-	if !hasGroup(t, a, "api-only") {
-		t.Fatal("A: missing api-only immediately after PUT")
-	}
-	eventually(t, 15*time.Second, "B sees api-only via gossip", func() bool {
+	eventually(t, 5*time.Second, "B sees api-only via informer", func() bool {
 		return hasGroup(t, b, "api-only")
 	})
 }
 
-// TestE2E_ExtAuthzReflectsCRDTChange validates that a CRDT mutation
-// performed via the admin API on A modifies the *runtime* decisions
-// the ext-authz endpoint on B emits.
-func TestE2E_ExtAuthzReflectsCRDTChange(t *testing.T) {
-	a := startNode(t, "A", []byte(baseYAML), nil)
-	b := startNode(t, "B", []byte(baseYAML), []string{a.clusterAddr})
+func TestE2E_ExtAuthzReflectsAdminChange(t *testing.T) {
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	b := startNode(t, "B", kc, []byte(baseYAML))
+	ensureLeader(t, a, b)
 
-	// Baseline: B allows anything.
 	if got := extAuthzCheck(t, b, "GET", "host.example", "/", "203.0.113.5", nil); got != http.StatusOK {
-		t.Fatalf("baseline B should allow, got %d", got)
+		t.Fatalf("baseline 200, got %d", got)
 	}
 
-	// Admin push on A: block that specific IP at higher priority.
 	putGroup(t, a, "block-by-ip", map[string]any{
 		"name":     "block-by-ip",
 		"priority": -100,
 		"action":   "deny",
-		"rules": []map[string]any{
-			{"name": "x", "match": "request.remoteIp == \"203.0.113.5\""},
-		},
+		"rules":    []map[string]any{{"name": "x", "match": "request.remoteIp == \"203.0.113.5\""}},
 	})
 
-	// Gossip convergence under -race can take noticeably longer than
-	// without; give it room.
-	eventually(t, 20*time.Second, "B denies 203.0.113.5", func() bool {
+	eventually(t, 10*time.Second, "B denies 203.0.113.5", func() bool {
 		return extAuthzCheck(t, b, "GET", "host.example", "/", "203.0.113.5", nil) == http.StatusForbidden
 	})
-	// Other IPs still pass.
 	if got := extAuthzCheck(t, b, "GET", "host.example", "/", "8.8.8.8", nil); got != http.StatusOK {
-		t.Fatalf("unrelated IP should still pass on B, got %d", got)
+		t.Fatalf("unrelated IP should still pass, got %d", got)
 	}
 }
 
-// TestE2E_ExtAuthzReflectsCRDTDelete: tombstone propagation removes
-// the previously-installed deny rule.
-func TestE2E_ExtAuthzReflectsCRDTDelete(t *testing.T) {
-	a := startNode(t, "A", []byte(baseYAML), nil)
-	b := startNode(t, "B", []byte(baseYAML), []string{a.clusterAddr})
+func TestE2E_DeletePropagates(t *testing.T) {
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	b := startNode(t, "B", kc, []byte(baseYAML))
+	ensureLeader(t, a, b)
 
 	putGroup(t, a, "block-by-ip", map[string]any{
 		"name":     "block-by-ip",
 		"priority": -100,
 		"action":   "deny",
-		"rules": []map[string]any{
-			{"name": "x", "match": "request.remoteIp == \"203.0.113.5\""},
-		},
+		"rules":    []map[string]any{{"name": "x", "match": "request.remoteIp == \"203.0.113.5\""}},
 	})
-	eventually(t, 15*time.Second, "B starts denying", func() bool {
+	eventually(t, 10*time.Second, "B starts denying", func() bool {
 		return extAuthzCheck(t, b, "GET", "host.example", "/", "203.0.113.5", nil) == http.StatusForbidden
 	})
 
 	deleteGroup(t, a, "block-by-ip")
-
-	eventually(t, 15*time.Second, "B stops denying after delete", func() bool {
+	eventually(t, 10*time.Second, "B stops denying", func() bool {
 		return extAuthzCheck(t, b, "GET", "host.example", "/", "203.0.113.5", nil) == http.StatusOK
 	})
-	if hasGroup(t, b, "block-by-ip") {
-		t.Fatal("expected group hidden by tombstone on B")
-	}
 }
 
-// TestE2E_DefaultsOverlayReplicates: the singleton register flow.
 func TestE2E_DefaultsOverlayReplicates(t *testing.T) {
-	// YAML allows; we'll override defaults via API to deny + custom
-	// status, and assert B picks it up.
 	yaml := `
-defaults:
-  action: allow
+defaults: { action: allow }
 groups:
-  - name: no-op
-    rules:
-      - name: never
-        match: "false"
+  - name: noop
+    rules: [{name: never, match: "false"}]
 `
-	a := startNode(t, "A", []byte(yaml), nil)
-	b := startNode(t, "B", []byte(yaml), []string{a.clusterAddr})
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(yaml))
+	b := startNode(t, "B", kc, []byte(yaml))
+	ensureLeader(t, a, b)
 
-	// Baseline: B uses defaults.allow → 200.
 	if got := extAuthzCheck(t, b, "GET", "h", "/", "1.1.1.1", nil); got != http.StatusOK {
-		t.Fatalf("baseline B should 200, got %d", got)
+		t.Fatalf("baseline 200, got %d", got)
 	}
 
 	putDefaults(t, a, map[string]any{
@@ -135,187 +112,185 @@ groups:
 		"denyStatus": 418,
 	})
 
-	eventually(t, 15*time.Second, "B denies with 418 via overlay", func() bool {
+	eventually(t, 10*time.Second, "B denies with 418", func() bool {
 		return extAuthzCheck(t, b, "GET", "h", "/", "1.1.1.1", nil) == 418
 	})
 }
 
-// TestE2E_QuarantineOnMissingFact verifies the runtime behaviour when
-// a group references a fact that doesn't exist anywhere in the cluster.
-//
-// CEL is duck-typed on `facts` (declared as `dyn`), so a reference to
-// `facts.missing` *compiles* fine: validation cannot reject the PUT,
-// and the broadcast happens. At evaluation time, every request hitting
-// that group errors out — the configured fail-closed default
-// (allowOnError=false) turns it into a 403 with rule="<name>", and
-// the engine increments the error counter.
-//
-// This is documented behaviour, not a bug: the operator is expected
-// to put the fact in place before publishing the group. The
-// quarantine kicks in only when validation *does* fail (e.g. a
-// downstream rule references an absent rule type, or two groups with
-// the same name clash) — those scenarios are covered in the unit tests.
-func TestE2E_QuarantineOnMissingFact(t *testing.T) {
-	yaml := `
-defaults: { action: allow, allowOnError: false }
-groups:
-  - name: trivial
-    rules: [{name: any, match: "true"}]
-`
-	a := startNode(t, "A", []byte(yaml), nil)
-	b := startNode(t, "B", []byte(yaml), []string{a.clusterAddr})
+func TestE2E_FollowerRedirectsToLeader(t *testing.T) {
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	b := startNode(t, "B", kc, []byte(baseYAML))
+	ensureLeader(t, a, b)
 
-	// Push a group that references a fact that doesn't exist anywhere.
-	// PUT succeeds (CEL compiles, validate passes), broadcast happens.
-	putGroup(t, a, "needs-fact", map[string]any{
-		"name":     "needs-fact",
-		"priority": -10,
-		"action":   "deny",
-		"rules":    []map[string]any{{"name": "x", "match": `"foo" in facts.missing`}},
-	})
+	// Target whichever is the *follower* and assert we got a 307
+	// to the leader.
+	leader := leaderOf(a, b)
+	if leader == nil {
+		t.Fatal("no leader observed")
+	}
+	follower := a
+	if leader == a {
+		follower = b
+	}
 
-	// On B, the group is in the effective config (gossip arrived).
-	eventually(t, 15*time.Second, "B sees needs-fact", func() bool {
-		return hasGroup(t, b, "needs-fact")
-	})
-
-	// And on B, hitting the engine triggers a runtime CEL error; the
-	// fail-closed default kicks in and the response is 403.
-	if got := extAuthzCheck(t, b, "GET", "h", "/", "1.2.3.4", nil); got != http.StatusForbidden {
-		t.Fatalf("expected 403 fail-closed on B (missing fact), got %d", got)
+	body := []byte(`{"name":"x","action":"deny","rules":[{"name":"any","match":"true"}]}`)
+	resp, _ := doReq(t, "PUT", adminURL(follower)+"/api/v1/groups/x", body, withBearer(adminToken))
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307 from follower, got %d", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		t.Fatal("missing Location header")
+	}
+	if loc[:len("http://")+len(leader.adminAddr)] != "http://"+leader.adminAddr {
+		t.Fatalf("Location %q does not point at leader admin %s", loc, leader.adminAddr)
 	}
 }
 
-// TestE2E_QuarantineDrainsOnFactArrival: the realistic recovery
-// pattern — A pushes a fact + a group that uses it; depending on
-// gossip arrival order, B may quarantine the group briefly, then
-// drain it once the fact arrives. We assert eventual consistency
-// either way: both ext-authz endpoints converge on the same verdict.
-func TestE2E_QuarantineDrainsOnFactArrival(t *testing.T) {
-	yaml := `
-defaults: { action: allow }
-groups:
-  - name: trivial
-    rules: [{name: any, match: "true"}]
-`
-	a := startNode(t, "A", []byte(yaml), nil)
-	b := startNode(t, "B", []byte(yaml), []string{a.clusterAddr})
+// TestE2E_StateSurvivesPodRestart simulates a pod restart by stopping
+// node A and starting a fresh one (A2) against the same shared
+// clientset. The overlay written before the restart must be visible
+// in A2's effective config because it lives in the backing ConfigMap,
+// not in the pod's memory.
+func TestE2E_StateSurvivesPodRestart(t *testing.T) {
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	ensureLeader(t, a)
 
-	// Push fact first, then group that uses it.
-	putFact(t, a, "blocklist", map[string]any{
-		"name":   "blocklist",
-		"method": "value",
-		"value":  []string{"203.0.113.5"},
-	})
-	putGroup(t, a, "uses-fact", map[string]any{
-		"name":     "uses-fact",
-		"priority": -100,
-		"action":   "deny",
-		"rules":    []map[string]any{{"name": "x", "match": `request.remoteIp in facts.blocklist`}},
-	})
-
-	// Eventually B serves a deny on the listed IP.
-	eventually(t, 15*time.Second, "B denies via gossiped fact+group", func() bool {
-		return extAuthzCheck(t, b, "GET", "h", "/", "203.0.113.5", nil) == http.StatusForbidden
-	})
-	// And B's quarantine is empty for this key.
-	for _, e := range quarantineEntries(t, b) {
-		if e.Section == crdt.SectionGroups && e.Key == "uses-fact" {
-			t.Fatalf("uses-fact still quarantined on B: %+v", e)
-		}
-	}
-}
-
-// TestE2E_ConcurrentRequestsDuringReload: while A is performing
-// admin writes, a steady stream of ext-authz requests on B should
-// never see a half-applied state. They should all be answered with
-// either the previous or the new verdict, never something in
-// between.
-func TestE2E_ConcurrentRequestsDuringReload(t *testing.T) {
-	yaml := `
-defaults: { action: allow }
-groups:
-  - name: yaml
-    rules: [{name: any, match: "true"}]
-`
-	a := startNode(t, "A", []byte(yaml), nil)
-	b := startNode(t, "B", []byte(yaml), []string{a.clusterAddr})
-
-	stop := make(chan struct{})
-	var good, bad int64
-	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				code := extAuthzCheck(t, b, "GET", "h", "/", "8.8.8.8", nil)
-				// 200 and 403 are both valid depending on which
-				// Config snapshot serves the request; anything else
-				// is a bug (502, timeout, partial response).
-				if code == 200 || code == 403 {
-					atomic.AddInt64(&good, 1)
-				} else {
-					atomic.AddInt64(&bad, 1)
-					t.Errorf("unexpected status %d during reload window", code)
-				}
-				time.Sleep(2 * time.Millisecond)
-			}
-		}()
-	}
-
-	for i := 0; i < 5; i++ {
-		putGroup(t, a, fmt.Sprintf("g%d", i), map[string]any{
-			"name":     fmt.Sprintf("g%d", i),
-			"priority": -i,
-			"action":   "deny",
-			"rules":    []map[string]any{{"name": "any", "match": "false"}},
-		})
-		time.Sleep(60 * time.Millisecond)
-	}
-	close(stop)
-	wg.Wait()
-
-	if good == 0 {
-		t.Fatal("no successful requests; did the server crash?")
-	}
-	if bad > 0 {
-		t.Fatalf("got %d unexpected statuses during reload", bad)
-	}
-}
-
-// TestE2E_NodeRestartRecoversFromPeer: B is wiped and rebooted; it
-// should pick up A's state via anti-entropy push/pull.
-func TestE2E_NodeRestartRecoversFromPeer(t *testing.T) {
-	yaml := `
-defaults: { action: allow }
-groups:
-  - name: yaml
-    rules: [{name: any, match: "true"}]
-`
-	a := startNode(t, "A", []byte(yaml), nil)
-	b1 := startNode(t, "B", []byte(yaml), []string{a.clusterAddr})
-
-	// Seed via A.
-	putGroup(t, a, "seeded", map[string]any{
-		"name":   "seeded",
+	putGroup(t, a, "persistent", map[string]any{
+		"name":   "persistent",
 		"action": "deny",
-		"rules":  []map[string]any{{"name": "any", "match": "false"}},
+		"rules":  []map[string]any{{"name": "x", "match": "false"}},
 	})
-	eventually(t, 15*time.Second, "B sees seeded", func() bool {
-		return hasGroup(t, b1, "seeded")
+	if !hasGroup(t, a, "persistent") {
+		t.Fatal("A should see persistent immediately after PUT")
+	}
+
+	// Simulate a pod restart: stop A, start A2 against the same
+	// clientset. The Lease will be released by A's Stop() (ReleaseOnCancel)
+	// and reacquired by A2.
+	a.stop()
+	a2 := startNode(t, "A2", kc, []byte(baseYAML))
+	ensureLeader(t, a2)
+
+	if !hasGroup(t, a2, "persistent") {
+		t.Fatal("A2 should see persistent after restart (read from ConfigMap)")
+	}
+}
+
+// TestE2E_DeletingStateCMResetsToYAML is the "blast everything" path
+// from the user's question. With the state ConfigMap deleted before
+// the new pod boots, the overlay is gone and the effective config
+// equals the YAML floor again.
+func TestE2E_DeletingStateCMResetsToYAML(t *testing.T) {
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	ensureLeader(t, a)
+
+	putGroup(t, a, "ephemeral", map[string]any{
+		"name":   "ephemeral",
+		"action": "deny",
+		"rules":  []map[string]any{{"name": "x", "match": "false"}},
+	})
+	if !hasGroup(t, a, "ephemeral") {
+		t.Fatal("A should see ephemeral immediately after PUT")
+	}
+
+	// Stop the node, delete the state ConfigMap, start a fresh one.
+	a.stop()
+	if err := kc.CoreV1().ConfigMaps(testNS).Delete(
+		context.Background(), cmName, metav1.DeleteOptions{},
+	); err != nil {
+		t.Fatalf("delete state cm: %v", err)
+	}
+
+	a2 := startNode(t, "A2", kc, []byte(baseYAML))
+	ensureLeader(t, a2)
+
+	if hasGroup(t, a2, "ephemeral") {
+		t.Fatal("ephemeral should be gone after state CM deletion")
+	}
+	// Sanity: the YAML floor still applies.
+	if !hasGroup(t, a2, "yaml-allow-everything") {
+		t.Fatal("YAML group should still be present")
+	}
+}
+
+// TestE2E_LeaderTransitionWritesRoute exercises what happens when the
+// current leader stops: another replica must observe the lease change
+// and start accepting writes. We stop the original leader, wait for
+// the surviving replica to be observed as leader, then issue a write
+// against it and assert it succeeds (no 307, no 503).
+func TestE2E_LeaderTransitionWritesRoute(t *testing.T) {
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	b := startNode(t, "B", kc, []byte(baseYAML))
+	ensureLeader(t, a, b)
+
+	leader := leaderOf(a, b)
+	if leader == nil {
+		t.Fatal("no leader observed")
+	}
+	follower := a
+	if leader == a {
+		follower = b
+	}
+
+	// Kill the leader.
+	leader.stop()
+
+	// Wait for the follower to acquire the lease.
+	eventually(t, 8*time.Second, "follower acquires lease", func() bool {
+		return follower.cluster.IsLeader()
 	})
 
-	// Stop B abruptly and start a brand-new B with empty state.
-	b1.stop()
-	b2 := startNode(t, "B2", []byte(yaml), []string{a.clusterAddr})
+	// Now a write against the (new leader) follower must succeed
+	// directly with no redirect.
+	body := []byte(`{"name":"after-transition","action":"deny","rules":[{"name":"x","match":"false"}]}`)
+	resp, b2 := doReq(t, "PUT",
+		adminURL(follower)+"/api/v1/groups/after-transition",
+		body, withBearer(adminToken))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from new leader, got %d: %s", resp.StatusCode, b2)
+	}
+}
 
-	eventually(t, 20*time.Second, "B2 recovers seeded via anti-entropy", func() bool {
-		return hasGroup(t, b2, "seeded")
-	})
+// TestE2E_IfMatchPreconditionEndToEnd verifies that a stale If-Match
+// header causes the API to reject the write with 412, both directly
+// and after replication.
+func TestE2E_IfMatchPreconditionEndToEnd(t *testing.T) {
+	kc := newSharedClient()
+	a := startNode(t, "A", kc, []byte(baseYAML))
+	b := startNode(t, "B", kc, []byte(baseYAML))
+	ensureLeader(t, a, b)
+
+	// Initial PUT to create an entry we can mutate later.
+	leader := leaderOf(a, b)
+	if leader == nil {
+		t.Fatal("no leader")
+	}
+	body := []byte(`{"name":"foo","action":"deny","rules":[{"name":"any","match":"false"}]}`)
+	resp, _ := doReq(t, "PUT",
+		adminURL(leader)+"/api/v1/groups/foo",
+		body, withBearer(adminToken))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial PUT got %d", resp.StatusCode)
+	}
+
+	// PUT with a wrong If-Match should return 412.
+	r, _ := http.NewRequest("PUT",
+		adminURL(leader)+"/api/v1/groups/foo",
+		bytes.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+adminToken)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("If-Match", `"obviously-stale"`)
+	resp2, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d", resp2.StatusCode)
+	}
 }

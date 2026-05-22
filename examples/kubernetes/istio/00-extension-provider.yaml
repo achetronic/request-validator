@@ -1,0 +1,50 @@
+# Register request-validator as an ext-authz HTTP provider in the
+# mesh. This is a one-off mesh-wide change: every AuthorizationPolicy
+# in the cluster can then reference it by name.
+#
+# How to apply: this block has to go into your istiod's MeshConfig.
+# Typical paths:
+#   - kubectl -n istio-system edit configmap istio
+#       and merge into the `mesh:` data key.
+#   - IstioOperator/IstioRevision custom resource:
+#       spec.meshConfig.extensionProviders: [...]
+#   - Helm value:
+#       meshConfig.extensionProviders: [...]
+#
+# Adapt to whatever way you manage istiod's config.
+meshConfig:
+  extensionProviders:
+    - name: request-validator
+      envoyExtAuthzHttp:
+        # Service in this repository's examples/kubernetes manifests.
+        service: request-validator.request-validator.svc.cluster.local
+        port: 8080
+        # Forward bodies up to 1 MiB so policies can inspect JSON
+        # payloads. Match this to your policy's defaults.maxBodyBytes.
+        includeRequestBodyInCheck:
+          maxRequestBytes: 1048576
+          allowPartialMessage: false
+        # Diagnostic headers the daemon adds — exposed back to the
+        # caller on deny so people can see which rule decided.
+        headersToDownstreamOnDeny:
+          - content-type
+          - x-rv-result
+          - x-rv-rule
+          - x-rv-reason
+          - x-rv-dry-run
+        # And forwarded to the protected service on allow, so it can
+        # log "I let this request through because rule X matched".
+        headersToUpstreamOnAllow:
+          - x-rv-rule
+          - x-rv-reason
+          - x-rv-dry-run
+        # The headers Envoy will copy into the check call. Only what
+        # your policy actually inspects: keep the surface minimal.
+        includeRequestHeadersInCheck:
+          - authorization
+          - content-type
+          - cookie
+          - x-api-key
+          - x-forwarded-for
+          - x-forwarded-proto
+          - x-user-groups

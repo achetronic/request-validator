@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: request-validator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: request-validator
+rules:
+  # The informer needs to list+watch ConfigMaps in the namespace.
+  # resourceNames cannot be used on list/watch, so we scope those to
+  # the namespace and rely on the field selector inside the informer
+  # to limit what's actually cached.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["request-validator-state"]
+    verbs: ["get", "update", "patch"]
+  # Same shape for the Lease.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "watch", "create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["request-validator-leader"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: request-validator
+subjects:
+  - kind: ServiceAccount
+    name: request-validator
+roleRef:
+  kind: Role
+  name: request-validator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: request-validator-admin
+type: Opaque
+stringData:
+  token: kind-e2e-token
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: request-validator-policy
+data:
+  policy.yaml: |
+    defaults:
+      action: allow
+      denyStatus: 403
+    groups:
+      - name: yaml-allow
+        action: allow
+        rules:
+          - name: any
+            match: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: request-validator
+spec:
+  selector:
+    app.kubernetes.io/name: request-validator
+  ports:
+    - name: extauthz
+      port: 8080
+      targetPort: 8080
+    - name: admin
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: request-validator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: request-validator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: request-validator
+    spec:
+      serviceAccountName: request-validator
+      containers:
+        - name: main
+          image: rv-e2e:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/policy/policy.yaml
+            - --admin-port=8081
+            - --admin-token-file=/etc/admin/token
+            - --log-format=json
+            - --log-level=info
+          ports:
+            - { name: extauthz, containerPort: 8080 }
+            - { name: admin,    containerPort: 8081 }
+          volumeMounts:
+            - { name: policy, mountPath: /etc/policy }
+            - { name: admin-token, mountPath: /etc/admin, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+      volumes:
+        - name: policy
+          configMap:
+            name: request-validator-policy
+        - name: admin-token
+          secret:
+            secretName: request-validator-admin
+            items: [{ key: token, path: token }]

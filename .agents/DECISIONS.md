@@ -295,6 +295,13 @@ lexicographic by `name` (since the API has no inherent order).
 
 ## D-015 - Admin CRUD API: gossip + CRDT, no external database
 
+> **Superseded by D-021.** This entry is retained for historical
+> context. The project briefly used `hashicorp/memberlist` + a custom
+> LWW CRDT for replication between replicas; that was replaced with a
+> Kubernetes-native model (Lease for leader election, ConfigMap for
+> state) because the deployment surface is k8s-only and the simpler
+> model removed the "last-write-wins can lose writes" pitfall.
+
 **Context.** Operators needed to manage groups (and, by extension,
 facts / defaults / logging) at runtime without editing the ConfigMap.
 Requirements: stateless binary, no external DB, must scale to many
@@ -389,6 +396,12 @@ validation is cheap at admin-write frequency.
 
 ## D-018 - CRDT mutation triggers the hot-reload code path
 
+> **Superseded by D-021.** The mechanism survives in spirit
+> (admin/store mutations trigger the same atomic-rebuild path) but the
+> "CRDT" wording is no longer accurate. Today, ConfigMap updates
+> observed via the informer trigger the same `Merge → Compile → Swap`
+> pipeline.
+
 **Context.** We already have a battle-tested rebuild + `atomic.Swap`
 flow for YAML reload (D-010, D-011). Admin API writes and gossip
 deltas could either reuse it or invent a new in-place mutation path.
@@ -414,6 +427,13 @@ gossiped) schedules a debounced rebuild that goes through
   re-compile only once and stay cached for the lifetime of that env.
 
 ## D-019 - Quarantine for gossiped deltas that fail local validation
+
+> **Superseded by D-021.** Quarantine made sense when each replica
+> applied gossiped deltas independently and could disagree on
+> validity. With consensus on a single ConfigMap, every replica sees
+> the same state at the same revision; a write that does not validate
+> on the leader is rejected with 400 and never reaches the store.
+> `internal/quarantine` has been removed.
 
 **Context.** Eventually consistent systems can deliver deltas out of
 order. A group whose CEL references `facts.bar` might arrive at node B
@@ -530,3 +550,78 @@ path. Operators can observe and act; the system is self-healing.
   operators may need to query each replica when triaging.
 - The retry is cheap (it runs as part of the rebuild anyway), and
   unbounded retention is fine because the buffer is small in practice.
+
+## D-020 - OpenAPI 3.1 spec generated from code via swaggo/swag v2
+
+(Unchanged. Still applicable. See entry above the section break, where
+the original wording lives.)
+
+## D-021 - Replication via Kubernetes Lease + ConfigMap (k8s-only)
+
+**Context.** D-015 picked gossip + CRDT because we wanted "no external
+database". In practice, the only deployment target is Kubernetes, and
+the CRDT's last-write-wins resolution can silently lose admin writes
+in concurrency edge cases. For an authorisation tool, "occasionally
+loses a write" is not acceptable.
+
+We explored two stronger options: Raft (`hashicorp/raft`) and a
+Kubernetes-native model that reuses the API server + etcd as the
+consensus layer (`coordination.k8s.io/v1.Lease` for leader election,
+a single ConfigMap as the replicated state).
+
+**Decision.** Kubernetes-native: Lease + ConfigMap.
+
+**Reasoning.**
+
+- The k8s API server (backed by etcd) already provides strongly
+  consistent, durable, audited storage. Reusing it removes the need
+  to ship Raft snapshots, log compaction and bootstrap dance.
+- A `Lease` is a battle-tested primitive used by kube-controller-
+  manager, kube-scheduler and every controller worth its salt. It
+  gives us deterministic leader election with no code on our side.
+- A single ConfigMap with a `state.json` key is enough for the
+  expected admin overlay size (~50 KB for ~100 groups). The 1 MiB
+  per-ConfigMap limit is comfortably out of reach.
+- The whole replication subsystem becomes ~500 lines (state.Store
+  interface + ConfigMap backend + Lease wrapper) instead of ~1500
+  (Raft FSM + log + snapshots + bootstrap + joins).
+
+**Consequences.**
+
+- The daemon **requires Kubernetes** in production. A
+  `--no-kubernetes` flag preserves a single-node mode (in-memory
+  state, optional JSON persistence) for `go run`, tests and dev.
+- New dependencies: `k8s.io/client-go`, `k8s.io/api`,
+  `k8s.io/apimachinery`. Binary grew by ~8 MB.
+- Followers reject writes with 307 Temporary Redirect pointing at the
+  leader's admin URL. Read endpoints (`GET /api/v1/...`) work on any
+  replica.
+- During leader transitions (typically <2 s after the previous
+  leader dies) writes get 503 with `Retry-After: 2`.
+- `internal/crdt`, `internal/quarantine`, the gossip-based
+  `internal/cluster` and all their tests have been removed. The
+  replacement packages are `internal/state` (with `state/memory`
+  and `state/configmap` backends) and `internal/cluster` (now a
+  thin wrapper over `client-go/tools/leaderelection`).
+- New flags: `--namespace`, `--state-configmap`, `--leader-lease`,
+  `--kubeconfig`, `--no-kubernetes`, `--state-file`. Old gossip flags
+  (`--cluster-bind`, `--cluster-discovery-dns`, etc.) are gone.
+- New admin endpoint: `GET /api/v1/cluster` (leader info). The
+  quarantine endpoints are gone.
+- `If-Match` (ETag) semantics are preserved end-to-end via the
+  ConfigMap's `resourceVersion`. The k8s API server enforces
+  optimistic concurrency for us.
+
+### D-021 addendum: RBAC must allow list+watch on the namespace
+
+While bringing up the Kind E2E suite we discovered a non-obvious
+constraint: Kubernetes RBAC rules with `resourceNames` **cannot
+restrict `list` or `watch`** (the API server returns 403 on
+list/watch when `resourceNames` is set, because it cannot evaluate
+those at list time). client-go's SharedInformer uses
+list+watch as its primary mechanism, so the Role must grant those
+verbs at the namespace level for `configmaps` and `leases`. Mutations
+(`get`, `update`, `patch`) are still safely scoped to the single
+ConfigMap and the single Lease via `resourceNames`. The committed
+manifests under `internal/e2e/testdata/kind/manifests.yaml`, the
+README and the OPERATIONS.md sample reflect this.

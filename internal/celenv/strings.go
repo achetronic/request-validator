@@ -20,10 +20,10 @@ import (
 //
 // Pattern syntax:
 //
-//	*        matches any sequence of characters except '/'
-//	**       matches any sequence of characters INCLUDING '/'
-//	?        matches exactly one character
-//	[abc]    character class
+//   - matches any sequence of characters except '/'
+//     **       matches any sequence of characters INCLUDING '/'
+//     ?        matches exactly one character
+//     [abc]    character class
 //
 // The patterns are translated to RE2 internally and compiled once per pattern.
 func stringLibrary() cel.EnvOption {

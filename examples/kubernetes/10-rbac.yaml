@@ -1,0 +1,47 @@
+---
+# ServiceAccount the pods run as.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: request-validator
+  namespace: request-validator
+---
+# RBAC for the replicated state (ConfigMap) and leader election (Lease).
+#
+# Kubernetes RBAC does NOT honour `resourceNames` on `list` and `watch`,
+# so those verbs are namespace-scoped. The actual mutations are still
+# tightly scoped to the two object names this daemon needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: request-validator
+  namespace: request-validator
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["request-validator-state"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "watch", "create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["request-validator-leader"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: request-validator
+  namespace: request-validator
+subjects:
+  - kind: ServiceAccount
+    name: request-validator
+    namespace: request-validator
+roleRef:
+  kind: Role
+  name: request-validator
+  apiGroup: rbac.authorization.k8s.io

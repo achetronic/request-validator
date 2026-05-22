@@ -19,19 +19,14 @@ package adminapi
 
 import "net/http"
 
-// docDelete is a no-op signature reused by the DELETE doc stubs.
 func docDelete(_ http.ResponseWriter, _ *http.Request) {}
-
-// docGet is a no-op signature reused by the GET doc stubs.
-func docGet(_ http.ResponseWriter, _ *http.Request) {}
-
-// docPut is a no-op signature reused by the PUT doc stubs.
-func docPut(_ http.ResponseWriter, _ *http.Request) {}
+func docGet(_ http.ResponseWriter, _ *http.Request)    {}
+func docPut(_ http.ResponseWriter, _ *http.Request)    {}
 
 // listGroupsDoc documents GET /api/v1/groups.
 //
-//	@Summary		List CRDT-managed groups
-//	@Description	Returns every group currently held in the CRDT store on this node. YAML-only groups are NOT included; use GET /api/v1/config for the merged effective view.
+//	@Summary		List overlay-managed groups
+//	@Description	Returns every group currently held in the replicated state on this node. YAML-only groups are NOT included; use GET /api/v1/config for the merged effective view.
 //	@Tags			groups
 //	@Produce		json
 //	@Security		BearerAuth
@@ -42,13 +37,13 @@ func listGroupsDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 
 // getGroupDoc documents GET /api/v1/groups/{name}.
 //
-//	@Summary		Get a single CRDT-managed group
+//	@Summary		Get a single overlay-managed group
 //	@Tags			groups
 //	@Produce		json
 //	@Security		BearerAuth
 //	@Param			name	path		string	true	"group name"
 //	@Success		200		{object}	ItemResponse
-//	@Header			200		{string}	Etag	"opaque concurrency token (\"<ts>-<node>\")"
+//	@Header			200		{string}	Etag	"opaque concurrency token"
 //	@Failure		401		{object}	ErrorResponse
 //	@Failure		404		{object}	ErrorResponse
 //	@Router			/api/v1/groups/{name} [get]
@@ -57,7 +52,7 @@ func getGroupDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 // putGroupDoc documents PUT /api/v1/groups/{name}.
 //
 //	@Summary		Upsert a group
-//	@Description	Replaces the group with the given name. The whole effective config is recompiled; if validation fails the live policy is untouched and the offending entry is pushed to the local quarantine.
+//	@Description	Only the cluster leader accepts writes; followers reply with 307 Temporary Redirect to the leader. The entire effective config is recompiled before persisting; on validation failure the live policy is untouched and the change is rejected with 400.
 //	@Tags			groups
 //	@Accept			json
 //	@Produce		json
@@ -67,29 +62,33 @@ func getGroupDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 //	@Param			body		body		GroupRequest	true	"group payload, same shape as a YAML group entry"
 //	@Success		200			{object}	ItemResponse
 //	@Header			200			{string}	Etag			"new concurrency token"
-//	@Failure		400			{object}	ErrorResponse	"validation/compile failed; entry quarantined"
+//	@Failure		307			"this replica is not the leader; follow the Location header"
+//	@Failure		400			{object}	ErrorResponse	"validation/compile failed"
 //	@Failure		401			{object}	ErrorResponse
-//	@Failure		412			{object}	ErrorResponse	"If-Match did not match the live stamp"
+//	@Failure		412			{object}	ErrorResponse	"If-Match did not match the live revision"
+//	@Failure		503			{object}	ErrorResponse	"no leader currently elected"
 //	@Router			/api/v1/groups/{name} [put]
 func putGroupDoc(w http.ResponseWriter, r *http.Request) { docPut(w, r) }
 
 // deleteGroupDoc documents DELETE /api/v1/groups/{name}.
 //
 //	@Summary		Delete a group
-//	@Description	Writes a tombstone. If a YAML group with the same name exists, it is hidden by the tombstone until the YAML entry is also removed.
+//	@Description	Removes the overlay entry; if a YAML group with the same name exists, the YAML one becomes the effective group again.
 //	@Tags			groups
 //	@Security		BearerAuth
 //	@Param			name		path	string	true	"group name"
 //	@Param			If-Match	header	string	false	"opaque concurrency token"
 //	@Success		204			"deleted"
+//	@Failure		307			"this replica is not the leader; follow the Location header"
 //	@Failure		401			{object}	ErrorResponse
-//	@Failure		412			{object}	ErrorResponse	"If-Match did not match the live stamp"
+//	@Failure		412			{object}	ErrorResponse	"If-Match did not match the live revision"
+//	@Failure		503			{object}	ErrorResponse	"no leader currently elected"
 //	@Router			/api/v1/groups/{name} [delete]
 func deleteGroupDoc(w http.ResponseWriter, r *http.Request) { docDelete(w, r) }
 
 // listFactsDoc documents GET /api/v1/facts.
 //
-//	@Summary		List CRDT-managed facts
+//	@Summary		List overlay-managed facts
 //	@Tags			facts
 //	@Produce		json
 //	@Security		BearerAuth
@@ -114,7 +113,7 @@ func getFactDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 // putFactDoc documents PUT /api/v1/facts/{name}.
 //
 //	@Summary		Upsert a fact
-//	@Description	Same semantics as a YAML facts entry. URL facts spin up a fetcher on the next rebuild; the previous fetcher (if any) is stopped first.
+//	@Description	URL facts spin up a fetcher on the next rebuild; the previous fetcher (if any) is stopped first. Leader-only.
 //	@Tags			facts
 //	@Accept			json
 //	@Produce		json
@@ -123,22 +122,26 @@ func getFactDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 //	@Param			If-Match	header		string			false	"opaque concurrency token"
 //	@Param			body		body		FactRequest		true	"fact payload"
 //	@Success		200			{object}	ItemResponse
+//	@Failure		307			"this replica is not the leader"
 //	@Failure		400			{object}	ErrorResponse
 //	@Failure		401			{object}	ErrorResponse
 //	@Failure		412			{object}	ErrorResponse
+//	@Failure		503			{object}	ErrorResponse
 //	@Router			/api/v1/facts/{name} [put]
 func putFactDoc(w http.ResponseWriter, r *http.Request) { docPut(w, r) }
 
 // deleteFactDoc documents DELETE /api/v1/facts/{name}.
 //
-//	@Summary		Delete a fact
+//	@Summary		Delete a fact (leader-only)
 //	@Tags			facts
 //	@Security		BearerAuth
 //	@Param			name		path	string	true	"fact name"
 //	@Param			If-Match	header	string	false	"opaque concurrency token"
 //	@Success		204			"deleted"
+//	@Failure		307			"this replica is not the leader"
 //	@Failure		401			{object}	ErrorResponse
 //	@Failure		412			{object}	ErrorResponse
+//	@Failure		503			{object}	ErrorResponse
 //	@Router			/api/v1/facts/{name} [delete]
 func deleteFactDoc(w http.ResponseWriter, r *http.Request) { docDelete(w, r) }
 
@@ -157,7 +160,7 @@ func getDefaultsDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 
 // putDefaultsDoc documents PUT /api/v1/defaults.
 //
-//	@Summary		Override the defaults block
+//	@Summary		Override the defaults block (leader-only)
 //	@Description	Per-field overlay over the YAML defaults. Any field omitted from the body keeps its YAML value.
 //	@Tags			defaults
 //	@Accept			json
@@ -165,19 +168,23 @@ func getDefaultsDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 //	@Security		BearerAuth
 //	@Param			body	body		DefaultsRequest	true	"fields to override"
 //	@Success		200		{object}	RegisterResponse
+//	@Failure		307		"this replica is not the leader"
 //	@Failure		400		{object}	ErrorResponse
 //	@Failure		401		{object}	ErrorResponse
+//	@Failure		503		{object}	ErrorResponse
 //	@Router			/api/v1/defaults [put]
 func putDefaultsDoc(w http.ResponseWriter, r *http.Request) { docPut(w, r) }
 
 // deleteDefaultsDoc documents DELETE /api/v1/defaults.
 //
-//	@Summary		Clear the defaults overlay
+//	@Summary		Clear the defaults overlay (leader-only)
 //	@Description	After this call the YAML defaults are the effective ones again.
 //	@Tags			defaults
 //	@Security		BearerAuth
 //	@Success		204
+//	@Failure		307			"this replica is not the leader"
 //	@Failure		401	{object}	ErrorResponse
+//	@Failure		503	{object}	ErrorResponse
 //	@Router			/api/v1/defaults [delete]
 func deleteDefaultsDoc(w http.ResponseWriter, r *http.Request) { docDelete(w, r) }
 
@@ -195,32 +202,36 @@ func getLoggingDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 
 // putLoggingDoc documents PUT /api/v1/logging.
 //
-//	@Summary		Override the logging block
+//	@Summary		Override the logging block (leader-only)
 //	@Tags			logging
 //	@Accept			json
 //	@Produce		json
 //	@Security		BearerAuth
 //	@Param			body	body		LoggingRequest	true	"fields to override"
 //	@Success		200		{object}	RegisterResponse
+//	@Failure		307		"this replica is not the leader"
 //	@Failure		400		{object}	ErrorResponse
 //	@Failure		401		{object}	ErrorResponse
+//	@Failure		503		{object}	ErrorResponse
 //	@Router			/api/v1/logging [put]
 func putLoggingDoc(w http.ResponseWriter, r *http.Request) { docPut(w, r) }
 
 // deleteLoggingDoc documents DELETE /api/v1/logging.
 //
-//	@Summary		Clear the logging overlay
+//	@Summary		Clear the logging overlay (leader-only)
 //	@Tags			logging
 //	@Security		BearerAuth
 //	@Success		204
+//	@Failure		307			"this replica is not the leader"
 //	@Failure		401	{object}	ErrorResponse
+//	@Failure		503	{object}	ErrorResponse
 //	@Router			/api/v1/logging [delete]
 func deleteLoggingDoc(w http.ResponseWriter, r *http.Request) { docDelete(w, r) }
 
 // getConfigDoc documents GET /api/v1/config.
 //
 //	@Summary		Effective compiled policy
-//	@Description	Returns the policy the engine would evaluate right now (YAML floor + CRDT overrides), with sources annotated per group.
+//	@Description	Returns the policy the engine would evaluate right now (YAML floor + admin overrides), with sources annotated per group.
 //	@Tags			config
 //	@Produce		json
 //	@Security		BearerAuth
@@ -230,31 +241,17 @@ func deleteLoggingDoc(w http.ResponseWriter, r *http.Request) { docDelete(w, r) 
 //	@Router			/api/v1/config [get]
 func getConfigDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 
-// listQuarantineDoc documents GET /api/v1/quarantine.
+// getClusterDoc documents GET /api/v1/cluster.
 //
-//	@Summary		List quarantined CRDT entries
-//	@Description	Per-node view: each replica may legitimately quarantine different items depending on its current state. Items are re-evaluated on every rebuild.
-//	@Tags			quarantine
+//	@Summary		Cluster status and leader info
+//	@Description	Returns whether this replica is currently the leader, the leader's admin URL (for client-side redirects), and whether the daemon runs in standalone mode.
+//	@Tags			cluster
 //	@Produce		json
 //	@Security		BearerAuth
-//	@Success		200	{object}	QuarantineListResponse
+//	@Success		200	{object}	ClusterResponse
 //	@Failure		401	{object}	ErrorResponse
-//	@Router			/api/v1/quarantine [get]
-func listQuarantineDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
-
-// deleteQuarantineDoc documents DELETE /api/v1/quarantine/{section}/{name}.
-//
-//	@Summary		Drop a quarantined entry without retry
-//	@Description	The CRDT entry itself is NOT removed (it remains the source of truth); only the local quarantine buffer is cleared for this key.
-//	@Tags			quarantine
-//	@Security		BearerAuth
-//	@Param			section	path	string	true	"groups|facts|defaults|logging"
-//	@Param			name	path	string	false	"key name (empty for singleton sections)"
-//	@Success		204
-//	@Failure		401	{object}	ErrorResponse
-//	@Failure		404	{object}	ErrorResponse
-//	@Router			/api/v1/quarantine/{section}/{name} [delete]
-func deleteQuarantineDoc(w http.ResponseWriter, r *http.Request) { docDelete(w, r) }
+//	@Router			/api/v1/cluster [get]
+func getClusterDoc(w http.ResponseWriter, r *http.Request) { docGet(w, r) }
 
 // openAPIDoc documents GET /api/v1/openapi.json.
 //

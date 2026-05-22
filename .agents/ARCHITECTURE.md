@@ -12,42 +12,40 @@ internal/
   celenv/             CEL environment, custom functions, program cache
   jsonpath/           tiny JSONPath subset (used by `jsonPath` CEL fn)
   facts/              facts registry: inline values, file reads, URL fetchers
-  policy/             config types, YAML parser, evaluator
+  policy/             config types, YAML parser, evaluator, Merge(YAML + overlay)
   configwatch/        fsnotify wrapper, debounce, k8s ConfigMap-aware
   httpserver/         /healthz, /readyz, /metrics, ext-authz endpoint
-  crdt/               LWW-Map (groups, facts) + LWW-Register (defaults, logging),
-                      local JSON persistence with debounce + fsync
-  cluster/            hashicorp/memberlist wrapper: peer discovery, broadcast,
-                      anti-entropy sync, delta application
+  state/              Store interface for the replicated admin overlay
+  state/memory/       in-memory Store (standalone mode + tests); optional JSON file
+  state/configmap/    Kubernetes ConfigMap Store with shared informer + If-Match
+  cluster/            leader election via Kubernetes Lease (client-go/tools/leaderelection)
   adminapi/           CRUD HTTP API on a separate port, bearer-token auth,
-                      surfaces /api/v1/{groups,facts,defaults,logging,config,quarantine}
-  quarantine/         buffer for gossiped or local changes that fail validation;
-                      re-evaluated on every Config rebuild
+                      surfaces /api/v1/{groups,facts,defaults,logging,config,cluster}
+  metrics/            small Prometheus counter registry used by httpserver/metrics.go
 ```
 
 The dependency graph is acyclic and one-directional:
 
 ```
-cmd  ──►  policy ──►  facts
-              │        │
+cmd  ──►  policy   ──►  facts
+              │           │
               ├──►  celenv  ──►  jsonpath
               │
 cmd  ──►  httpserver  ──►  policy
 cmd  ──►  configwatch
-cmd  ──►  crdt
-cmd  ──►  cluster      ──►  crdt
-cmd  ──►  adminapi     ──►  crdt, policy, quarantine
-cmd  ──►  quarantine
-cmd  ──►  log          (everyone else also imports log)
+cmd  ──►  state    ──►  state/memory | state/configmap
+cmd  ──►  cluster
+cmd  ──►  adminapi ──►  state, cluster, policy
+cmd  ──►  log         (everyone else also imports log)
 ```
 
-`log` is the only package every other one depends on. It must stay
-dependency-free of the rest.
+`log` and `metrics` are the only packages every other one may depend
+on. They must stay dependency-free of the rest.
 
 ## Config types (at runtime)
 
 `policy.Config` is the parsed YAML plus compiled state, possibly merged
-with overrides from the CRDT store:
+with overrides from the state store:
 
 ```
 Config{
@@ -64,29 +62,29 @@ Config{
 
 A `Group` carries a `Priority int` (default 0; smaller = evaluated
 earlier; ties broken by stable order of declaration, with YAML groups
-preceding CRDT-provided ones on equal priority). It also carries its
+preceding API-provided ones on equal priority). It also carries its
 compiled `matchProg cel.Program`, and each `Rule` carries its own.
 Compilation happens once in `LoadBytes()` / `Merge()`; the request
 path only executes already-compiled programs.
 
-### Effective config (YAML + CRDT overrides)
+### Effective config (YAML + state overrides)
 
-The engine never sees the raw YAML or the raw CRDT in isolation; it
+The engine never sees the raw YAML or the replicated state in isolation; it
 sees an **effective** `*Config` produced by merging both:
 
 ```
-LoadBytes(yaml) ─┐
-                 ├──► Merge(yaml, crdt.Snapshot()) ──► validate ──► compile ──► atomic.Swap
-crdt.Snapshot() ─┘
+LoadBytes(yaml)  ─┐
+                  ├──► Merge(yaml, store.Snapshot()) ──► validate ──► compile ──► atomic.Swap
+store.Snapshot() ─┘
 ```
 
 Merge rules (uniform across all sections):
 
-- `groups` and `facts`: the union of YAML and CRDT entries, keyed by
-  `name`. If a name exists in both, the **CRDT entry wins** (override).
-  Tombstoned CRDT entries hide the YAML entry with the same name.
+- `groups` and `facts`: the union of YAML and overlay entries, keyed by
+  `name`. If a name exists in both, the **state entry wins** (override).
+  Deletes hide the YAML entry with the same name.
 - `defaults` and `logging`: per-field override. Any field present in
-  the CRDT LWW-Register replaces the YAML value; absent fields keep
+  the state register replaces the YAML value; absent fields keep
   the YAML value. Unsetting a field via API (PUT with the field absent
   / null) restores the YAML value.
 
@@ -205,28 +203,24 @@ previous policy. This is fail-closed by design (see `DECISIONS.md`).
 Three triggers, same code path:
 
 - **fsnotify** (default, on by default): the parent directory of the
-  config file is watched. `configwatch.relevant()` reacts to events on
+  policy file is watched. `configwatch.relevant()` reacts to events on
   the file itself OR on the `..data` symlink that Kubernetes flips when
   a ConfigMap projection is updated. Events are debounced (200 ms by
   default) and converge into a single reload.
 - **SIGHUP**: classic, useful when fsnotify doesn't deliver (NFS, FUSE).
-- **CRDT mutation**: a successful admin API write, or a gossiped delta
-  applied to the local CRDT store, also triggers a rebuild via the same
-  function. Debounced (50 ms) so bursts of gossip deltas converge into
-  one rebuild.
+- **State watch**: a successful admin API write on the leader, or a
+  ConfigMap revision observed by the local informer (any replica),
+  triggers a rebuild via the same function.
 
 A reload performs:
 
-1. `policy.LoadFile(path)` - parse + compile + build fresh facts registry.
-2. `policy.Merge(yamlCfg, crdt.Snapshot())` - apply API overrides.
+1. Read the current YAML bytes (already cached in `cmd/main.go`).
+2. `policy.MergeFromYAML(yaml, store.Snapshot())` - apply API
+   overrides on top.
 3. `newCfg.Start(ctx)` - initial fetch of URL facts.
-4. If any step fails, **log error and keep previous policy**. If the
-   trigger was a CRDT delta, push the offending entries into
-   `internal/quarantine`.
+4. If any step fails, **log error and keep previous policy**.
 5. `srv.SetPolicy(newCfg)` - atomic swap; returns the previous `*Config`.
 6. `oldCfg.Stop()` - cancel the previous fetcher goroutines.
-7. Re-evaluate the quarantine buffer: any item that now compiles is
-   removed; the rest stays until the next rebuild.
 
 In-flight requests started before the swap still see the old `Config` via
 the pointer they captured; new requests see the new one. The
@@ -273,140 +267,112 @@ The ext-authz port MUST NOT serve admin endpoints.
 
 See "Admin API" below for the full surface.
 
-## Cluster (`internal/cluster`)
+## Replication model
 
-A thin wrapper over `github.com/hashicorp/memberlist`. Owns:
+The admin API mutates a small piece of replicated state shared by every
+replica: the "admin overlay". In Kubernetes deployments this lives in
+a single ConfigMap; in standalone mode (no Kubernetes available) it
+falls back to an in-memory store with optional JSON persistence.
 
-- **Peer discovery**: a list of seed addresses (`--cluster-peers`) or a
-  DNS name (`--cluster-discovery-dns`, intended for a Kubernetes
-  headless Service). Resolution is repeated periodically so new
-  replicas joining a Deployment are picked up.
-- **Broadcast queue**: outgoing deltas are appended to a `TransmitLimitedQueue`
-  with retransmit factor tuned to the cluster size memberlist reports.
-- **Anti-entropy**: memberlist's push/pull sync (every 30 s by default)
-  exchanges full state digests, so a node missing deltas recovers.
-- **Delta application**: incoming user messages are decoded and applied
-  to the local `crdt.Store`. A successful apply triggers a debounced
-  Config rebuild; a validation failure pushes the offending key into
-  `internal/quarantine`.
-- **Node identity**: `NodeID` is the memberlist node name, stable across
-  the process lifetime. Used as the LWW tiebreaker.
+Leader election is delegated to a `Lease` in the
+`coordination.k8s.io/v1` API. The k8s API server arbitrates which pod
+holds the Lease at any moment; everyone else is a follower. The
+holder identity we publish into the Lease is `<podName>|<adminURL>`,
+so followers can compute the redirect Location for incoming writes
+without an extra round-trip.
 
-The cluster package is optional. When `--cluster-peers` and
-`--cluster-discovery-dns` are both empty, the node runs **standalone**:
-the CRDT store still works, gossip is just not started. This keeps
-single-replica deployments and tests trivial.
+### State store (`internal/state`)
 
-## CRDT store (`internal/crdt`)
+`state.Store` is the abstraction the admin API and the engine consume:
 
-Three CRDTs, all conflict-free and composable:
+```
+type Store interface {
+    Snapshot(ctx)                       (Snapshot, error)
+    Get(ctx, section, key)              (Entry, error)
+    Put(ctx, section, key, payload, ifMatch) (Revision, error)
+    Delete(ctx, section, key, ifMatch)  error
+    Watch(ctx)                          (<-chan ChangeEvent, error)
+    Close()                             error
+}
+```
 
-- **`LWWMap[K comparable, V any]`** - used by `groups` and `facts`. Each
-  entry carries `{value V, ts int64, node string, tombstone bool}`.
-  Merge per key: higher `ts` wins; on tie, lexicographic `node` wins.
-  Deletes write a tombstone instead of removing the entry; tombstones
-  GC after a configurable TTL (default 24 h).
-- **`LWWRegister[V any]`** - used by `defaults` and `logging`. A single
-  `{value V, ts int64, node string}`. Setting any field replaces the
-  whole register (callers are expected to read-modify-write, then PUT).
-- **Composite `Store`** - aggregates the four CRDTs above plus a
-  `Snapshot()` method that returns a stable, copy-on-read view used by
-  `policy.Merge`.
+Two implementations live under `internal/state/`:
 
-### Persistence
+- **`memory.Store`** (subpackage `memory`): a map + RWMutex, with
+  optional persistence to a local JSON file written via
+  `tmp → fsync → rename → fsync(dir)`. Used in standalone mode and
+  in tests. Watch emits in-process notifications.
+- **`configmap.Store`** (subpackage `configmap`): backed by a single
+  ConfigMap in a configurable namespace, with a key
+  `state.json` holding the full overlay payload. Reads come from a
+  SharedIndexInformer cache; writes do `Update` against the API
+  server with `resourceVersion` as the optimistic concurrency
+  token (a 409 from kube-apiserver becomes `state.ErrConflict`,
+  which the admin API surfaces as 412 Precondition Failed). Watch
+  fans out informer Updates plus a low-frequency poll backstop
+  (every 500 ms) so a missed watch event never leaves a replica
+  stuck on a stale view.
 
-The store snapshots to a single JSON file (`--state-file`, default
-`/var/lib/request-validator/state.json`). Writes use:
+### Cluster (`internal/cluster`)
 
-1. `write(tmp)` to a sibling tempfile.
-2. `f.Sync()` (fsync of the file).
-3. `os.Rename(tmp, final)` (atomic on POSIX).
-4. fsync the parent directory.
+`cluster.Cluster` is a thin wrapper over
+`k8s.io/client-go/tools/leaderelection`. Owns:
 
-Writes are debounced at 1 s. On boot, the file is read into the store
-before gossip starts; gossip then fills any gaps from peers. If the
-file is missing or corrupt, the node starts with an empty store and
-relies on peers; if no peers respond within the discovery window, the
-store stays empty and the YAML alone governs (fail-stable).
+- The Lease lifecycle: acquire, renew, release on context cancel.
+- A `Leader()` snapshot readable from the admin API's hot path
+  (atomic pointer, no locks).
+- A standalone fallback: when the cluster is constructed with a nil
+  client, `IsLeader()` always returns true and `Standalone()` is
+  true. Useful for `go run` and tests.
 
-### Concurrency
-
-Each map / register is guarded by a `sync.RWMutex`. Reads (`Snapshot`)
-take RLock; writes take Lock. This is *not* the hot path - the hot path
-sees the already-built `*policy.Config`, not the CRDT - so the lock is
-acceptable. CRDT writes happen at admin-API frequency (low) and gossip
-apply frequency (low-to-moderate).
+Bootstrap is a single call: `cluster.Bootstrap(ctx, opts)`. There is
+no concept of "first replica" or `--cluster-bootstrap`: the Lease is
+created lazily by whoever wins the first acquisition. Joining is
+implicit (the kubelet's pod IP makes the pod reachable; the Lease
+identity carries the admin URL).
 
 ## Admin API (`internal/adminapi`)
 
-CRUD over the CRDT store. Listens on the admin port. Auth: a single
+CRUD over the state store. Listens on the admin port. Auth: a single
 bearer token read from `--admin-token-file`; the file is watched with
 fsnotify and re-read on change. No token configured → admin API is not
 started at all.
 
-| Method | Path                                  | Body / Effect                                              |
-| ------ | ------------------------------------- | ---------------------------------------------------------- |
-| GET    | `/api/v1/groups`                      | list of CRDT-managed groups                                |
-| GET    | `/api/v1/groups/{name}`               | single group + `source` (`api`) + `quarantined` flag       |
-| PUT    | `/api/v1/groups/{name}`               | upsert; body is the same shape as a YAML group             |
-| DELETE | `/api/v1/groups/{name}`               | tombstone (hides the YAML-side homonym, if any)            |
-| GET    | `/api/v1/facts`                       | idem for facts                                             |
-| GET    | `/api/v1/facts/{name}`                |                                                            |
-| PUT    | `/api/v1/facts/{name}`                |                                                            |
-| DELETE | `/api/v1/facts/{name}`                |                                                            |
-| GET    | `/api/v1/defaults`                    | current CRDT-side defaults (may be empty)                  |
-| PUT    | `/api/v1/defaults`                    | replace the defaults register                              |
-| DELETE | `/api/v1/defaults`                    | clear the register (YAML defaults take over again)         |
-| GET    | `/api/v1/logging`                     | idem                                                       |
-| PUT    | `/api/v1/logging`                     |                                                            |
-| DELETE | `/api/v1/logging`                     |                                                            |
-| GET    | `/api/v1/config`                      | the effective `*Config` currently serving traffic          |
-| GET    | `/api/v1/quarantine`                  | list quarantined items with reasons                        |
-| DELETE | `/api/v1/quarantine/{section}/{name}` | drop a quarantined entry without retrying                  |
+| Method | Path                                  | Notes                                                    |
+| ------ | ------------------------------------- | -------------------------------------------------------- |
+| GET    | `/api/v1/groups`                      | list of overlay-managed groups                           |
+| GET    | `/api/v1/groups/{name}`               | single group; carries `Etag` for `If-Match`              |
+| PUT    | `/api/v1/groups/{name}`               | upsert; **leader only**, followers reply 307             |
+| DELETE | `/api/v1/groups/{name}`               | tombstone; **leader only**                               |
+| GET    | `/api/v1/facts[/{name}]`              | idem for facts                                           |
+| PUT    | `/api/v1/facts/{name}`                | **leader only**                                          |
+| DELETE | `/api/v1/facts/{name}`                | **leader only**                                          |
+| GET    | `/api/v1/defaults`                    | current overlay defaults (404 if unset)                  |
+| PUT    | `/api/v1/defaults`                    | replace; **leader only**                                 |
+| DELETE | `/api/v1/defaults`                    | clear; YAML defaults take over again; **leader only**    |
+| GET    | `/api/v1/logging`                     | idem                                                     |
+| PUT    | `/api/v1/logging`                     | **leader only**                                          |
+| DELETE | `/api/v1/logging`                     | **leader only**                                          |
+| GET    | `/api/v1/config`                      | effective `*Config` currently serving traffic            |
+| GET    | `/api/v1/cluster`                     | who is leader, am I leader, lease until, standalone bool |
+| GET    | `/api/v1/openapi.json`                | generated OpenAPI 3.1 spec of this API                   |
 
-Write semantics:
+Write semantics on the leader:
 
-1. Acquire a process-wide write mutex (so concurrent PUTs serialise).
-2. Apply the change to a *copy* of the CRDT store.
-3. Build a candidate `*Config` via `policy.Merge` + validate + compile.
-4. On failure: 400 with the validator error. The real store is untouched.
-5. On success: commit to the real store, broadcast the delta via cluster,
-   schedule a Config rebuild + atomic swap.
+1. Process-wide write mutex serialises concurrent PUTs.
+2. Build a hypothetical `Snapshot` with the change applied to a copy.
+3. Run `policy.MergeFromYAML(yaml, hypothetical)`; on failure, 400.
+4. Commit to the real store with `If-Match` honoured (412 on mismatch).
+5. Trigger a local rebuild + atomic Config swap so the caller has
+   read-your-writes immediately. Other replicas pick up the change
+   via the store's Watch.
 
-All write responses include the resulting object plus `Etag` derived
-from `(name, ts, node)` for optimistic concurrency. PUTs accept an
-`If-Match` header; mismatch → 412.
+Write semantics on a follower:
 
-## Quarantine (`internal/quarantine`)
-
-A small typed buffer:
-
-```
-type Entry struct {
-    Section    string    // "groups" | "facts" | "defaults" | "logging"
-    Name       string    // empty for singletons
-    Payload    []byte    // raw CRDT value bytes
-    Reason     string    // validator/compile error message
-    Since      time.Time
-    LastRetry  time.Time
-    RetryCount int
-}
-```
-
-Entries are pushed when:
-
-- A gossiped delta arrives whose resulting `*Config` fails to compile.
-- A rebuild attempt finds an inconsistency (e.g. group references a
-  fact that no longer exists locally).
-
-Re-evaluation happens on every Config rebuild (any rebuild, regardless
-of trigger). Items that now compile are removed and integrated. Items
-that still fail stay; `RetryCount` and `LastRetry` are updated.
-
-The quarantine is *local per node*. It is **not** gossiped, because
-each node may quarantine different items depending on what state it
-holds. This is intentional - the gossiped CRDT remains the source of
-truth; quarantine is just a deferred-apply queue.
+- Reply with 307 Temporary Redirect and `Location` set to the
+  leader's `adminURL + r.URL.RequestURI()`.
+- If no leader is known yet (just after a Lease transition),
+  respond 503 with `Retry-After: 2`.
 
 ## Build & ship
 

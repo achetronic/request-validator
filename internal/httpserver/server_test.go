@@ -137,10 +137,8 @@ func TestMetricsEndpointIncludesGlobalCounters(t *testing.T) {
 	for _, want := range []string{
 		"request_validator_decisions_total{outcome=\"allow\"}",
 		"request_validator_admin_requests_total",
-		"request_validator_gossip_messages_total",
+		"request_validator_rebuilds_total",
 		"request_validator_rebuild_errors_total",
-		"request_validator_quarantine_size",
-		"request_validator_cluster_members",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q in /metrics, body=\n%s", want, body)

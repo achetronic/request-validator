@@ -8,7 +8,7 @@
 //
 //   - `firstMatch` (default): the first rule whose `match` is true wins.
 //   - `all`:                  every rule must hold; the first failure
-//                              produces a deny.
+//     produces a deny.
 //
 // A rule inherits its `action` from the group when it does not declare one,
 // which lets a "deny-by-default" group be expressed concisely.

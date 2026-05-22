@@ -30,13 +30,17 @@ race: ## go test -race
 	go test -race -count=1 ./...
 
 .PHONY: e2e
-e2e: ## Binary-level end-to-end tests (build tag e2e)
-	go test -tags e2e -timeout 5m -count=1 ./internal/e2e/...
+e2e: ## In-process end-to-end tests (fake k8s client). Runs by default with `make test` too.
+	go test -count=1 -timeout 5m ./internal/e2e/...
+
+.PHONY: e2e-kind
+e2e-kind: ## End-to-end against a real Kind cluster (requires kind, docker, kubectl). Slow.
+	go test -tags e2ekind -count=1 -timeout 10m -v ./internal/e2e/...
 
 ##@ OpenAPI
 
 SWAG ?= $(shell command -v swag 2>/dev/null)
-SWAG_DIRS = cmd,internal/adminapi,internal/crdt,internal/quarantine,internal/policy,internal/facts
+SWAG_DIRS = cmd,internal/adminapi,internal/state,internal/policy,internal/facts
 SWAG_OUT  = internal/adminapi/docs
 
 .PHONY: swagger-install

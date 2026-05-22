@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same branch / PR to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,19 +29,33 @@ jobs:
         with:
           go-version: '${{ steps.read_go_version.outputs.go_version }}'
 
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^internal/adminapi/docs/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "These files need 'gofmt -w':" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
       - name: go vet
         run: go vet ./...
+
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "go.mod or go.sum changed after 'go mod tidy'. Commit the result." >&2
+            exit 1
+          fi
 
       - name: install swag v2
         run: go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
 
       - name: openapi spec is up-to-date
-        run: |
-          # Regenerate to a scratch dir and diff against the committed one.
-          # Fails the build if the committed spec drifted from the source.
-          cp -r internal/adminapi/docs /tmp/docs-before
-          make swagger
-          diff -u /tmp/docs-before/swagger.json internal/adminapi/docs/swagger.json
+        # `make swagger-check` regenerates the spec and diffs against
+        # the committed one. Drift = red build, with the diff inline.
+        run: make swagger-check
 
       - name: go test
         run: go test -count=1 ./...
@@ -48,5 +67,38 @@ jobs:
         run: |
           CGO_ENABLED=0 go build -buildvcs=false ./cmd
 
-      - name: e2e (binary)
-        run: make e2e
+  e2e-kind:
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      # When set, the Kind test suite fails (instead of silently
+      # skipping) if kind/docker/kubectl are missing. We want loud
+      # failures in CI.
+      RV_KIND_REQUIRE_PREREQS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Go version from go.mod
+        id: read_go_version
+        run: |
+          go_version=$(grep -E "^go [0-9]" go.mod | awk '{print $2}')
+          echo "go_version=${go_version}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '${{ steps.read_go_version.outputs.go_version }}'
+
+      - name: install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: prereqs available
+        run: |
+          which kind
+          which docker
+          which kubectl
+          docker info >/dev/null
+
+      - name: e2e against Kind
+        run: make e2e-kind

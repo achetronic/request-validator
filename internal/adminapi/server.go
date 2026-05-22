@@ -1,24 +1,28 @@
 // Package adminapi exposes the CRUD HTTP surface that lets operators
-// inspect and mutate the CRDT-backed sections of the policy: groups,
-// facts, defaults and logging.
+// inspect and mutate the four overlay sections of the policy:
+// groups, facts, defaults and logging.
 //
 // The server listens on its own port (typically 8081), separate from
 // the ext-authz endpoint, and requires a bearer token loaded from a
 // file (--admin-token-file). The token file is watched with fsnotify
 // so rotating it never restarts the process.
 //
-// Writes are serialised through a process-wide mutex. Every successful
-// write:
+// Writes are only accepted by the cluster leader. Followers respond
+// with a 307 Temporary Redirect carrying the leader's admin URL in
+// `Location`. Reads (GET) are served locally on any replica from the
+// informer's cached view; the read-your-writes guarantee is provided
+// by HTTP clients following 307s back to the leader.
 //
-//   1. is applied to a copy of the CRDT store,
-//   2. drives a rebuild of the effective *policy.Config via
-//      policy.MergeFromYAML,
-//   3. on success, is committed to the live store, broadcast to the
-//      cluster (when configured) and the new *Config is installed via
-//      the supplied Apply callback.
+// Every successful write:
 //
-// A failed compile or validate is surfaced as a 400 with a useful
-// error message; the store is not mutated.
+//  1. Validates the resulting effective *Config by running
+//     policy.MergeFromYAML on a hypothetical snapshot. A failure
+//     returns 400 and the store is untouched.
+//  2. Calls state.Store.Put / Delete with the current revision as
+//     If-Match (when supplied), surfacing 412 on conflict.
+//  3. Schedules a rebuild via the Applier callback so the engine
+//     swaps to the new config atomically. The same rebuild fires on
+//     every replica via the store's watcher.
 package adminapi
 
 import (
@@ -37,19 +41,12 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"request-validator/internal/crdt"
+	"request-validator/internal/cluster"
 	"request-validator/internal/log"
 	rvmetrics "request-validator/internal/metrics"
 	"request-validator/internal/policy"
-	"request-validator/internal/quarantine"
+	"request-validator/internal/state"
 )
-
-// Broadcaster is the minimal surface adminapi needs from the cluster
-// layer to gossip a freshly accepted delta. A nil Broadcaster is
-// valid (standalone mode); writes still succeed locally.
-type Broadcaster interface {
-	BroadcastDelta(d crdt.Delta)
-}
 
 // Applier installs a freshly compiled *Config on the running engine.
 // Typically wired to httpserver.Server.SetPolicy plus the previous
@@ -65,21 +62,36 @@ type YAMLProvider func() []byte
 
 // Options configures the admin server.
 type Options struct {
-	Addr         string                  // ":8081" by default
-	TokenFile    string                  // required; without it New returns nil server
-	Store        *crdt.Store             // required
-	Quarantine   *quarantine.Buffer      // required
-	YAMLProvider YAMLProvider            // required
-	Broadcaster  Broadcaster             // optional, nil in standalone mode
-	Applier      Applier                 // required
-	NowFn        func() time.Time        // test hook
+	// Addr is the listen address. Defaults to ":8081".
+	Addr string
+
+	// TokenFile holds the bearer token. Without it New returns
+	// (nil, nil) and no admin server is started.
+	TokenFile string
+
+	// Store is the replicated state backend.
+	Store state.Store
+
+	// Cluster owns leader election. May be nil in single-replica
+	// in-memory setups; in that case all writes are accepted
+	// locally.
+	Cluster *cluster.Cluster
+
+	// YAMLProvider returns the current YAML floor.
+	YAMLProvider YAMLProvider
+
+	// Applier swaps the new compiled *Config into the engine.
+	Applier Applier
+
+	// NowFn is a test hook for time. Defaults to time.Now.
+	NowFn func() time.Time
 }
 
 // Server runs the admin HTTP API.
 type Server struct {
-	opts   Options
-	token  atomic.Pointer[string]
-	srv    *http.Server
+	opts    Options
+	token   atomic.Pointer[string]
+	srv     *http.Server
 	writeMu sync.Mutex
 
 	tokenWatchCancel context.CancelFunc
@@ -94,9 +106,6 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.Store == nil {
 		return nil, errors.New("adminapi: Options.Store required")
-	}
-	if opts.Quarantine == nil {
-		return nil, errors.New("adminapi: Options.Quarantine required")
 	}
 	if opts.YAMLProvider == nil {
 		return nil, errors.New("adminapi: Options.YAMLProvider required")
@@ -164,8 +173,7 @@ func (s *Server) Stop() {
 	s.tokenWatchWG.Wait()
 }
 
-// withMetrics increments rvmetrics.AdminRequests per response. The
-// status code is captured via a small wrapper.
+// withMetrics increments rvmetrics.AdminRequests per response.
 func (s *Server) withMetrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -201,11 +209,6 @@ func routeLabel(p string) string {
 	switch parts[0] {
 	case "groups", "facts":
 		return "/api/v1/" + parts[0] + "/{name}"
-	case "quarantine":
-		if len(parts) == 1 || parts[1] == "" {
-			return "/api/v1/quarantine"
-		}
-		return "/api/v1/quarantine/{section}"
 	}
 	return p
 }
@@ -320,64 +323,72 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-func etagFor(stamp crdt.Stamp) string {
-	return fmt.Sprintf("\"%d-%s\"", stamp.TS, stamp.Node)
+// etagFor formats a state.Revision as a quoted ETag value.
+func etagFor(rev state.Revision) string {
+	return `"` + string(rev) + `"`
 }
 
-// parseIfMatch returns the stamp encoded in an `If-Match` header, or
-// nil if the header is missing.
-func parseIfMatch(r *http.Request) *crdt.Stamp {
+// parseIfMatch returns the trimmed If-Match value, or "" if missing.
+// The wildcard "*" is preserved as-is so Store.Put can apply
+// "must-not-exist" semantics.
+func parseIfMatch(r *http.Request) state.Revision {
 	v := strings.TrimSpace(r.Header.Get("If-Match"))
 	if v == "" {
-		return nil
+		return ""
 	}
 	v = strings.Trim(v, "\"")
-	idx := strings.Index(v, "-")
-	if idx <= 0 {
-		return nil
-	}
-	var ts int64
-	if _, err := fmt.Sscanf(v[:idx], "%d", &ts); err != nil {
-		return nil
-	}
-	return &crdt.Stamp{TS: ts, Node: v[idx+1:]}
+	return state.Revision(v)
 }
 
-// Helpers exposed for tests.
-
-func (s *Server) currentTokenForTest() string {
-	if p := s.token.Load(); p != nil {
-		return *p
+// ensureLeaderOrRedirect serves a 307 to the current leader when this
+// replica is not the leader, or a 503 when no leader is known yet.
+// Returns true when the caller should proceed (we are the leader, or
+// no cluster is configured).
+func (s *Server) ensureLeaderOrRedirect(w http.ResponseWriter, r *http.Request) bool {
+	if s.opts.Cluster == nil || s.opts.Cluster.Standalone() {
+		return true
 	}
-	return ""
+	l := s.opts.Cluster.Leader()
+	if l.Self {
+		return true
+	}
+	if l.AdminURL == "" {
+		w.Header().Set("Retry-After", "2")
+		writeError(w, http.StatusServiceUnavailable, "no leader currently elected; retry shortly")
+		return false
+	}
+	loc := strings.TrimRight(l.AdminURL, "/") + r.URL.RequestURI()
+	w.Header().Set("Location", loc)
+	w.WriteHeader(http.StatusTemporaryRedirect)
+	return false
 }
 
 // rebuildAndApply runs the merge/validate/compile pipeline against
-// the supplied store snapshot and installs the result through the
-// Applier. It is the single place that touches the engine, so all
-// write paths share its error handling. quarantineKey, when non-empty,
-// is pushed to the quarantine buffer on failure.
-func (s *Server) rebuildAndApply(snap crdt.FullState, source string) error {
+// the supplied snapshot and installs the result through the Applier.
+// It is the single place that touches the engine.
+func (s *Server) rebuildAndApply(snap state.Snapshot, source string) error {
 	yamlBytes := s.opts.YAMLProvider()
 	cfg, err := policy.MergeFromYAML(yamlBytes, snap)
 	if err != nil {
 		return err
 	}
-	if err := s.opts.Applier.Apply(cfg, source); err != nil {
-		return err
+	return s.opts.Applier.Apply(cfg, source)
+}
+
+// previewMerge tries to build a *Config without committing it, used
+// to validate a candidate snapshot before persisting it. The
+// resulting Config is discarded (its facts registry is never started)
+// so this is cheap.
+func (s *Server) previewMerge(snap state.Snapshot) error {
+	yamlBytes := s.opts.YAMLProvider()
+	_, err := policy.MergeFromYAML(yamlBytes, snap)
+	return err
+}
+
+// currentTokenForTest is a test hook.
+func (s *Server) currentTokenForTest() string {
+	if p := s.token.Load(); p != nil {
+		return *p
 	}
-	// Re-evaluate the quarantine buffer: any entry that compiles now
-	// is removed and integrated.
-	removed := s.opts.Quarantine.Drain(func(e quarantine.Entry) bool {
-		// Decide based on whether the current snapshot would still
-		// fail for that key. For simplicity we just re-run the merge
-		// in-memory; the cost is negligible at admin frequency.
-		_, err := policy.MergeFromYAML(yamlBytes, snap)
-		return err != nil
-	})
-	for _, e := range removed {
-		log.Infow("admin: quarantine drained",
-			"section", e.Section, "key", e.Key, "reason", e.Reason)
-	}
-	return nil
+	return ""
 }

@@ -12,10 +12,11 @@
 //     deny rule but request was let through; useful for shadow testing.
 //
 // Diagnostic response headers (all prefixed `x-rv-`):
-//   x-rv-result      allow|deny
-//   x-rv-rule        name of the rule that decided (or "<defaults>")
-//   x-rv-reason      short explanation
-//   x-rv-dry-run     true|false
+//
+//	x-rv-result      allow|deny
+//	x-rv-rule        name of the rule that decided (or "<defaults>")
+//	x-rv-reason      short explanation
+//	x-rv-dry-run     true|false
 package httpserver
 
 import (

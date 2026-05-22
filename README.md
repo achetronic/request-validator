@@ -164,6 +164,23 @@ Groups are evaluated in order. Each group decides on its own and the
 **first** group that produces a verdict wins; if none do,
 `defaults.action` takes over.
 
+By default, groups run in the order you declare them. Add `priority: <int>`
+to a group to override that — smaller numbers run first, negatives are
+fine, and ties keep declaration order. Use it to put a guaranteed
+deny ahead of any allow list:
+
+```yaml
+groups:
+  - name: kill-switch
+    priority: -100      # always tried first
+    action: deny
+    rules: [{ name: bad-ip, match: 'request.remoteIp == "203.0.113.5"' }]
+  - name: allow-internal
+    # priority defaults to 0; runs after kill-switch
+    action: allow
+    rules: [{ name: from-cidr, match: 'inCIDR(request.remoteIp, ["10.0.0.0/8"])' }]
+```
+
 Inside a group, the optional `match` at the group level is a
 "do I apply to this request at all?" filter. If it returns false the
 group is skipped silently. Otherwise the group's `mode` runs:
@@ -432,12 +449,43 @@ request.headers['x-forwarded-for'].exists(v, inCIDR(v, ['10.0.0.0/8']))
 From source, with the bundled example:
 
 ```bash
-go run ./cmd --config examples/policy.yaml --log-level debug --log-format console
+go run ./cmd \
+  --config examples/policy.yaml \
+  --log-level debug --log-format console \
+  --no-kubernetes
 ```
 
+The `--no-kubernetes` flag is for local dev: it skips trying to talk
+to a kube-apiserver and keeps state in memory. In production the
+daemon expects to run inside Kubernetes (see "Replicated mode" below
+for the why).
+
 The project also ships an OCI image at
-`ghcr.io/achetronic/request-validator:<semver>`. Deploy it with
-whatever templating you already use. We use
+`ghcr.io/achetronic/request-validator:<semver>`.
+
+**Easiest path** if you just want it running on a real cluster:
+clone the repo and apply the worked example under
+[`examples/kubernetes/`](examples/kubernetes/):
+
+```bash
+# Generate a real admin token first (the file ships a placeholder).
+kubectl create namespace request-validator
+kubectl -n request-validator create secret generic request-validator-admin \
+  --from-literal=token=$(openssl rand -hex 32)
+
+# Then everything else in one shot:
+kubectl apply -k examples/kubernetes/
+```
+
+That gives you a `Deployment` with two replicas, the required
+RBAC, the policy `ConfigMap`, the `Service`, and a `PodDisruptionBudget`.
+The example folder also includes Istio integration manifests under
+`examples/kubernetes/istio/`. See its
+[README](examples/kubernetes/README.md) for the full walkthrough and
+common operational tasks.
+
+If you'd rather not use the plain manifests, the image is happy with
+whatever templating you already deploy with. We use
 [`bjw-s` app-template](https://github.com/bjw-s-labs/helm-charts/tree/main/charts/other/app-template);
 a minimal HelmRelease values block looks like:
 
@@ -451,26 +499,60 @@ controllers:
           tag: v0.1.0
         args:
           - --config=/etc/policy/policy.yaml
+          - --admin-token-file=/etc/admin/token
         probes:
           liveness:  { type: HTTP, custom: true, spec: { httpGet: { path: /healthz, port: 8080 } } }
           readiness: { type: HTTP, custom: true, spec: { httpGet: { path: /readyz,  port: 8080 } } }
 service:
-  main: { controller: main, ports: { http: { port: 8080 } } }
+  main: { controller: main, ports: { http: { port: 8080 }, admin: { port: 8081 } } }
 persistence:
   policy:
     type: configMap
     name: request-validator-policy
     globalMounts: [ { path: /etc/policy } ]
+  admin-token:
+    type: secret
+    name: request-validator-admin
+    globalMounts: [ { path: /etc/admin, readOnly: true } ]
 ```
 
+You still need the RBAC from `examples/kubernetes/10-rbac.yaml`
+either way — the daemon talks to the kube-apiserver to coordinate
+replicas.
+
 ### Endpoints
+
+Two ports. The ext-authz port is what Envoy talks to; the admin port
+exposes a CRUD API and is only started when `--admin-token-file` is
+set.
+
+ext-authz port (default `8080`):
 
 | Endpoint   | Purpose                                              |
 | ---------- | ---------------------------------------------------- |
 | `/`        | ext-authz endpoint; everything else lands here       |
 | `/healthz` | liveness                                             |
 | `/readyz`  | readiness; false until a policy is loaded            |
-| `/metrics` | Prometheus counters, broken down by group and rule   |
+| `/metrics` | Prometheus counters (decisions, admin requests, rebuilds, …) |
+
+admin port (default `8081`, disabled if no token file is set):
+
+| Endpoint                                  | Purpose                                              |
+| ----------------------------------------- | ---------------------------------------------------- |
+| `GET/PUT/DELETE /api/v1/groups[/{name}]`  | manage groups at runtime                             |
+| `GET/PUT/DELETE /api/v1/facts[/{name}]`   | same, for facts                                      |
+| `GET/PUT/DELETE /api/v1/defaults`         | override the YAML defaults block per-field           |
+| `GET/PUT/DELETE /api/v1/logging`          | same, for logging                                    |
+| `GET /api/v1/config`                      | effective merged config the engine is serving        |
+| `GET /api/v1/cluster`                     | leader info (pod, admin URL, lease until)            |
+| `GET /api/v1/openapi.json`                | OpenAPI 3.1 spec (also under `internal/adminapi/docs/`) |
+
+Every request needs `Authorization: Bearer <token>`, where the token
+is the trimmed contents of `--admin-token-file`. Writes are validated
+against the full merged config; a bad PUT returns 400 and the live
+policy is untouched. The YAML loaded at boot is the floor; anything
+set via the admin API overrides it per key. Drop the API value
+(`DELETE`) and the YAML one applies again.
 
 ### Hot reload
 
@@ -492,7 +574,76 @@ stays active.
 If fsnotify can't deliver events (NFS, FUSE), sending `SIGHUP`
 to the process triggers the same reload code path.
 
+### Replicated mode (optional)
+
+Run multiple replicas and the admin API writes are replicated between
+them through the Kubernetes API: a single ConfigMap holds the
+overlay, a `Lease` arbitrates which pod is the writer. No external
+database, no gossip, no consensus on our side — kube-apiserver and
+etcd do it for us.
+
+How it works:
+
+- Every replica reads and writes the same ConfigMap
+  (`request-validator-state` by default). The k8s API server
+  enforces optimistic concurrency via `resourceVersion`.
+- The pod holding the `Lease` (`request-validator-leader` by
+  default) is the leader. Followers serve reads from a local
+  informer cache; on writes they reply with **HTTP 307 Temporary
+  Redirect** pointing at the leader's admin URL. Curl with `-L`,
+  or any sane HTTP client, follows it transparently.
+- When the leader pod dies, another replica takes over within one
+  lease duration (~15 s). During that window writes get a **503**
+  with `Retry-After: 2`.
+- If you lose every pod at the same time, the ConfigMap (and the
+  Lease) survive in etcd. The first pod back up reads the state
+  and serves traffic immediately.
+
+The pod's ServiceAccount needs RBAC for two resources. The informer
+needs `list` and `watch` at the namespace level (those verbs ignore
+`resourceNames`); the actual mutations are scoped to our single
+ConfigMap / Lease:
+
+```yaml
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["list", "watch", "create"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["request-validator-state"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["list", "watch", "create"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  resourceNames: ["request-validator-leader"]
+  verbs: ["get", "update", "patch"]
+```
+
+No flags are needed beyond `--admin-token-file` if you're happy with
+the defaults. For dev or bare-metal where there is no Kubernetes API
+to talk to, pass `--no-kubernetes` to fall back to a single-replica
+in-memory mode (optionally persisting to `--state-file`).
+
+#### What survives what
+
+| Action                                         | Effect                                                                                |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Pod restart, rolling update, node reschedule   | Everything survives. The state ConfigMap lives in etcd; new pods read it on boot.     |
+| The whole Deployment scaled to 0 and back up   | Same: state survives.                                                                 |
+| `kubectl delete cm request-validator-state`    | The next boot recreates an empty ConfigMap. **All admin overrides are gone**; the engine serves the YAML floor again. |
+| `kubectl edit cm request-validator-policy`     | The YAML is reloaded via fsnotify within ~200 ms. Admin overrides keep winning per key. |
+| Edit the YAML AND have an admin override for the same key | The admin override still wins (see D-016 in `.agents/DECISIONS.md`).        |
+
+In other words: the YAML in Git is your declarative floor; the
+state ConfigMap is **runtime mutable state** owned by the cluster.
+Do not put the state ConfigMap in Git — it will get rewritten on
+every sync.
+
 ### Flags
+
+Ext-authz and reload:
 
 ```
 --port               HTTP port (default 8080)
@@ -502,6 +653,24 @@ to the process triggers the same reload code path.
 --watch              Auto-reload on config file changes (default true)
 --watch-debounce-ms  Debounce window for the watcher in ms (default 200)
 --version            Print version and exit
+```
+
+Admin API (off unless `--admin-token-file` is set):
+
+```
+--admin-port         Admin API port (default 8081)
+--admin-token-file   File holding the bearer token; without it, no admin API
+```
+
+Kubernetes integration (auto-detected in-cluster, override for dev):
+
+```
+--namespace          Namespace for the state ConfigMap + Lease (default: in-pod namespace)
+--state-configmap    ConfigMap name holding the overlay (default request-validator-state)
+--leader-lease       Lease name for leader election (default request-validator-leader)
+--kubeconfig         Path to a kubeconfig file (default: in-cluster config)
+--no-kubernetes      Disable k8s integration; standalone single-replica mode
+--state-file         Local JSON file for state persistence in standalone mode
 ```
 
 The config file is run through `os.ExpandEnv` before parsing, so you
@@ -525,7 +694,10 @@ to log "this request was let through by rule X" if it wants to.
 
 ## Plugging into Istio
 
-Two pieces of Istio configuration:
+Two pieces of Istio configuration. Ready-to-apply versions of both
+live under
+[`examples/kubernetes/istio/`](examples/kubernetes/istio/); the
+snippets below are the same content, kept inline for quick reading.
 
 1. Register the validator as an extension provider in `MeshConfig`.
    This is mesh-wide; one entry per validator deployment.

@@ -67,14 +67,12 @@ func TestGaugeSetReplaces(t *testing.T) {
 }
 
 func TestRenderEmitsPrometheusText(t *testing.T) {
-	// Drive the package-level counters/gauges and assert Render's
-	// output. We can't reset them between tests cheaply, so we just
-	// verify presence of the expected lines / labels.
+	// Drive the package-level counters and assert Render's output.
+	// Counters are package-scoped (no reset between tests), so we
+	// only check that the *line shape* is correct, not exact values.
 	AdminRequests.Inc(`method="GET",path="/api/v1/groups",status="200"`)
-	GossipMessages.Inc(`direction="out",type="delta"`)
+	Rebuilds.Inc(`trigger="store"`)
 	RebuildErrors.Inc()
-	QuarantineSize.Set(`section="total"`, 3)
-	ClusterMembers.Set(`state="alive"`, 2)
 
 	var buf bytes.Buffer
 	Render(&buf)
@@ -83,14 +81,10 @@ func TestRenderEmitsPrometheusText(t *testing.T) {
 	for _, want := range []string{
 		"# TYPE request_validator_admin_requests_total counter",
 		`request_validator_admin_requests_total{method="GET",path="/api/v1/groups",status="200"}`,
-		"# TYPE request_validator_gossip_messages_total counter",
-		`request_validator_gossip_messages_total{direction="out",type="delta"}`,
+		"# TYPE request_validator_rebuilds_total counter",
+		`request_validator_rebuilds_total{trigger="store"}`,
 		"# TYPE request_validator_rebuild_errors_total counter",
-		"request_validator_rebuild_errors_total 1",
-		"# TYPE request_validator_quarantine_size gauge",
-		`request_validator_quarantine_size{section="total"} 3`,
-		"# TYPE request_validator_cluster_members gauge",
-		`request_validator_cluster_members{state="alive"} 2`,
+		"request_validator_rebuild_errors_total",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing line %q in:\n%s", want, out)

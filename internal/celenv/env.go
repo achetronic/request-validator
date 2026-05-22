@@ -21,9 +21,9 @@ import (
 
 // Env is the compiled CEL environment plus a compiled-program cache.
 type Env struct {
-	env     *cel.Env
-	mu      sync.RWMutex
-	cache   map[string]cel.Program
+	env   *cel.Env
+	mu    sync.RWMutex
+	cache map[string]cel.Program
 }
 
 // New builds the global CEL environment with all custom functions and

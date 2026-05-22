@@ -1,0 +1,128 @@
+---
+# Service for the ext-authz endpoint (Envoy / Istio reach the daemon here)
+# and the admin API (operators reach the admin port via port-forward or
+# their own ingress).
+apiVersion: v1
+kind: Service
+metadata:
+  name: request-validator
+  namespace: request-validator
+  labels:
+    app.kubernetes.io/name: request-validator
+spec:
+  selector:
+    app.kubernetes.io/name: request-validator
+  ports:
+    - name: extauthz
+      port: 8080
+      targetPort: extauthz
+    - name: admin
+      port: 8081
+      targetPort: admin
+---
+# Two-replica Deployment. The Lease + ConfigMap model means the
+# replicas coordinate through the kube-apiserver; no inter-pod
+# networking, no headless Service, no PVC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: request-validator
+  namespace: request-validator
+  labels:
+    app.kubernetes.io/name: request-validator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: request-validator
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Keep one replica serving traffic during rollouts. The leader
+      # transition costs ~lease-duration of write-503s in the worst
+      # case; reads keep working.
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: request-validator
+    spec:
+      serviceAccountName: request-validator
+      # If you have at least two nodes, spread the replicas. Soft
+      # because a single-node dev cluster should still schedule both.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: request-validator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: main
+          # Replace the tag with the version you want to pin.
+          image: ghcr.io/achetronic/request-validator:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/policy/policy.yaml
+            - --admin-port=8081
+            - --admin-token-file=/etc/admin/token
+            - --log-format=json
+            - --log-level=info
+          ports:
+            - { name: extauthz, containerPort: 8080 }
+            - { name: admin,    containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: extauthz }
+            periodSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: extauthz }
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/policy
+              readOnly: true
+            - name: admin-token
+              mountPath: /etc/admin
+              readOnly: true
+      volumes:
+        - name: policy
+          configMap:
+            name: request-validator-policy
+        - name: admin-token
+          secret:
+            secretName: request-validator-admin
+            items: [{ key: token, path: token }]
+---
+# Keep at least one replica running during voluntary disruptions
+# (node drain, eviction). With replicas=2 this means a drain has to
+# wait for the new pod to be Ready before evicting the next one.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: request-validator
+  namespace: request-validator
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: request-validator

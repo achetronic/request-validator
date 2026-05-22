@@ -7,18 +7,18 @@
 //
 // Three retrieval methods are supported, distinguished by the `method` field:
 //
-//   value: literal value declared inline in the YAML. Any YAML scalar,
-//            list or map. Exposed to CEL untouched.
+//	value: literal value declared inline in the YAML. Any YAML scalar,
+//	         list or map. Exposed to CEL untouched.
 //
-//   file:  bytes read from a file on disk. Re-read on demand by the policy
-//            watcher (which already invalidates the whole policy on any
-//            change inside the config directory). Exposed to CEL as a string.
-//            Parse it in CEL with `parseJSON(...)` / `parseYAML(...)`.
+//	file:  bytes read from a file on disk. Re-read on demand by the policy
+//	         watcher (which already invalidates the whole policy on any
+//	         change inside the config directory). Exposed to CEL as a string.
+//	         Parse it in CEL with `parseJSON(...)` / `parseYAML(...)`.
 //
-//   url:   bytes fetched periodically by a background goroutine. Refreshed
-//            every `interval`. The most recently successful body is what
-//            CEL sees; if the next fetch fails the previous body is kept.
-//            Exposed to CEL as a string.
+//	url:   bytes fetched periodically by a background goroutine. Refreshed
+//	         every `interval`. The most recently successful body is what
+//	         CEL sees; if the next fetch fails the previous body is kept.
+//	         Exposed to CEL as a string.
 //
 // Usage is split between construction and runtime: New(specs) parses the
 // declarations and pre-populates inline entries without touching the network,
@@ -46,11 +46,11 @@ import (
 
 // Spec is the parsed YAML declaration of one facts entry.
 type Spec struct {
-	Name   string  `yaml:"name"`
-	Method string  `yaml:"method"` // "value" | "file" | "url"
-	Value  any     `yaml:"value,omitempty"`
-	File   *File   `yaml:"file,omitempty"`
-	URL    *URL    `yaml:"url,omitempty"`
+	Name   string `yaml:"name"`
+	Method string `yaml:"method"` // "value" | "file" | "url"
+	Value  any    `yaml:"value,omitempty"`
+	File   *File  `yaml:"file,omitempty"`
+	URL    *URL   `yaml:"url,omitempty"`
 }
 
 // File is the spec for the `file` method.

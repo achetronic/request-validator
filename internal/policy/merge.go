@@ -10,12 +10,13 @@ import (
 	yamlv3 "gopkg.in/yaml.v3"
 
 	"request-validator/internal/celenv"
-	"request-validator/internal/crdt"
 	"request-validator/internal/facts"
+	"request-validator/internal/state"
 )
 
-// MergeError carries the offending CRDT key (when applicable) so the
-// quarantine layer can route it back to the buffer.
+// MergeError carries the offending overlay key (when applicable) so
+// the admin API can route it back to the client as a 400 with a
+// useful message.
 type MergeError struct {
 	Section string
 	Key     string
@@ -31,28 +32,27 @@ func (e *MergeError) Error() string {
 
 func (e *MergeError) Unwrap() error { return e.Err }
 
-// MergeFromYAML parses the YAML once and overlays the CRDT state on
-// top of it, returning a freshly compiled effective *Config.
-func MergeFromYAML(yamlBytes []byte, state crdt.FullState) (*Config, error) {
+// MergeFromYAML parses the YAML once and overlays the state snapshot
+// on top of it, returning a freshly compiled effective *Config.
+func MergeFromYAML(yamlBytes []byte, snap state.Snapshot) (*Config, error) {
 	base := &Config{}
 	if len(yamlBytes) > 0 {
 		if err := yamlv3.Unmarshal(yamlBytes, base); err != nil {
 			return nil, fmt.Errorf("yaml: %w", err)
 		}
 	}
-	return Merge(base, state)
+	return Merge(base, snap)
 }
 
-// Merge produces a compiled effective *Config by overlaying CRDT state
-// on top of the parsed YAML. The YAML is the floor; CRDT entries
-// (live or tombstoned) override per-key. Defaults and logging are
-// merged per-field.
+// Merge produces a compiled effective *Config by overlaying a state
+// snapshot on top of the parsed YAML. The YAML is the floor; state
+// entries override per-key. Defaults and logging are merged per-field.
 //
 // `yamlCfg` must be a freshly parsed YAML view of the policy, with no
-// compiled state attached. The function will run applyDefaults,
+// compiled state attached. The function runs applyDefaults,
 // sortGroups, validate and compile on the merged result. Use
 // MergeFromYAML if you have only raw bytes.
-func Merge(yamlCfg *Config, state crdt.FullState) (*Config, error) {
+func Merge(yamlCfg *Config, snap state.Snapshot) (*Config, error) {
 	if yamlCfg == nil {
 		return nil, errors.New("policy: nil yaml config")
 	}
@@ -63,20 +63,20 @@ func Merge(yamlCfg *Config, state crdt.FullState) (*Config, error) {
 		Groups:   append([]Group(nil), yamlCfg.Groups...),
 	}
 
-	if err := mergeGroups(merged, state.Groups); err != nil {
+	if err := mergeGroups(merged, snap.Groups); err != nil {
 		return nil, err
 	}
-	if err := mergeFacts(merged, state.Facts); err != nil {
+	if err := mergeFacts(merged, snap.Facts); err != nil {
 		return nil, err
 	}
-	if state.Defaults != nil && state.Defaults.Set && !state.Defaults.Entry.Cleared {
-		if err := overlayDefaults(&merged.Defaults, state.Defaults.Entry.Payload); err != nil {
-			return nil, &MergeError{Section: crdt.SectionDefaults, Err: err}
+	if len(snap.Defaults) > 0 {
+		if err := overlayDefaults(&merged.Defaults, snap.Defaults); err != nil {
+			return nil, &MergeError{Section: state.SectionDefaults, Err: err}
 		}
 	}
-	if state.Logging != nil && state.Logging.Set && !state.Logging.Entry.Cleared {
-		if err := overlayLogging(&merged.Logging, state.Logging.Entry.Payload); err != nil {
-			return nil, &MergeError{Section: crdt.SectionLogging, Err: err}
+	if len(snap.Logging) > 0 {
+		if err := overlayLogging(&merged.Logging, snap.Logging); err != nil {
+			return nil, &MergeError{Section: state.SectionLogging, Err: err}
 		}
 	}
 
@@ -101,9 +101,9 @@ func Merge(yamlCfg *Config, state crdt.FullState) (*Config, error) {
 	return merged, nil
 }
 
-// mergeGroups overlays CRDT-managed group entries on top of the YAML
+// mergeGroups overlays state-managed group entries on top of the YAML
 // groups already copied into merged.Groups.
-func mergeGroups(merged *Config, entries map[string]crdt.MapEntry) error {
+func mergeGroups(merged *Config, entries map[string]json.RawMessage) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -112,8 +112,6 @@ func mergeGroups(merged *Config, entries map[string]crdt.MapEntry) error {
 		yamlIdx[g.Name] = i
 	}
 
-	// Decode every live API group, sorted by name for determinism among
-	// equal-priority entries.
 	keys := make([]string, 0, len(entries))
 	for k := range entries {
 		keys = append(keys, k)
@@ -123,23 +121,20 @@ func mergeGroups(merged *Config, entries map[string]crdt.MapEntry) error {
 	apiGroups := make([]Group, 0)
 	apiIndex := 0
 	for _, name := range keys {
-		entry := entries[name]
-		if entry.Tombstone {
-			if idx, ok := yamlIdx[name]; ok {
-				merged.Groups[idx] = Group{Name: "", Source: "__deleted"}
-			}
+		payload := entries[name]
+		if len(payload) == 0 {
 			continue
 		}
 		var g Group
-		if err := decodeYAMLViaJSON(entry.Payload, &g); err != nil {
-			return &MergeError{Section: crdt.SectionGroups, Key: name, Err: err}
+		if err := decodeYAMLViaJSON(payload, &g); err != nil {
+			return &MergeError{Section: state.SectionGroups, Key: name, Err: err}
 		}
 		if g.Name == "" {
 			g.Name = name
 		}
 		if g.Name != name {
 			return &MergeError{
-				Section: crdt.SectionGroups,
+				Section: state.SectionGroups,
 				Key:     name,
 				Err:     fmt.Errorf("payload name %q does not match key", g.Name),
 			}
@@ -148,8 +143,6 @@ func mergeGroups(merged *Config, entries map[string]crdt.MapEntry) error {
 		g.declarationIndex = apiIndex
 		apiIndex++
 		if idx, ok := yamlIdx[name]; ok {
-			// Replace YAML occurrence inline so the YAML declarationIndex
-			// is reused (preserves tie order even though Source differs).
 			yamlAt := merged.Groups[idx]
 			g.declarationIndex = yamlAt.declarationIndex
 			merged.Groups[idx] = g
@@ -157,22 +150,13 @@ func mergeGroups(merged *Config, entries map[string]crdt.MapEntry) error {
 		}
 		apiGroups = append(apiGroups, g)
 	}
-
-	// Compact tombstoned slots and append the new API-only groups.
-	out := merged.Groups[:0]
-	for _, g := range merged.Groups {
-		if g.Source == "__deleted" {
-			continue
-		}
-		out = append(out, g)
-	}
-	out = append(out, apiGroups...)
-	merged.Groups = out
+	merged.Groups = append(merged.Groups, apiGroups...)
 	return nil
 }
 
-// mergeFacts overlays CRDT-managed fact entries on top of the YAML facts.
-func mergeFacts(merged *Config, entries map[string]crdt.MapEntry) error {
+// mergeFacts overlays state-managed fact entries on top of the YAML
+// facts.
+func mergeFacts(merged *Config, entries map[string]json.RawMessage) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -188,23 +172,20 @@ func mergeFacts(merged *Config, entries map[string]crdt.MapEntry) error {
 
 	apiFacts := make([]facts.Spec, 0)
 	for _, name := range keys {
-		entry := entries[name]
-		if entry.Tombstone {
-			if idx, ok := yamlIdx[name]; ok {
-				merged.Facts[idx] = facts.Spec{Name: "__deleted"}
-			}
+		payload := entries[name]
+		if len(payload) == 0 {
 			continue
 		}
 		var f facts.Spec
-		if err := decodeYAMLViaJSON(entry.Payload, &f); err != nil {
-			return &MergeError{Section: crdt.SectionFacts, Key: name, Err: err}
+		if err := decodeYAMLViaJSON(payload, &f); err != nil {
+			return &MergeError{Section: state.SectionFacts, Key: name, Err: err}
 		}
 		if f.Name == "" {
 			f.Name = name
 		}
 		if f.Name != name {
 			return &MergeError{
-				Section: crdt.SectionFacts,
+				Section: state.SectionFacts,
 				Key:     name,
 				Err:     fmt.Errorf("payload name %q does not match key", f.Name),
 			}
@@ -215,35 +196,20 @@ func mergeFacts(merged *Config, entries map[string]crdt.MapEntry) error {
 		}
 		apiFacts = append(apiFacts, f)
 	}
-
-	out := merged.Facts[:0]
-	for _, f := range merged.Facts {
-		if f.Name == "__deleted" {
-			continue
-		}
-		out = append(out, f)
-	}
-	out = append(out, apiFacts...)
-	merged.Facts = out
+	merged.Facts = append(merged.Facts, apiFacts...)
 	return nil
 }
 
-// overlayDefaults parses payload as a Defaults struct and overlays any
-// non-zero fields onto target. Zero fields are treated as "not set"
-// and inherit from the YAML value.
+// overlayDefaults parses payload and overlays the present fields onto
+// target. Missing fields keep their YAML value.
 func overlayDefaults(target *Defaults, payload json.RawMessage) error {
 	if len(payload) == 0 || bytes.Equal(payload, []byte("null")) {
 		return nil
 	}
-	// Decode into a wire-shape struct keyed by the YAML tags so the
-	// JSON sent by the admin API matches the YAML schema verbatim.
 	var d Defaults
 	if err := decodeYAMLViaJSON(payload, &d); err != nil {
 		return err
 	}
-	// Per-field overlay: keep target zero values when the API didn't
-	// provide that key. We detect "provided" by also decoding the
-	// payload into a map and checking key presence.
 	keys, err := jsonKeys(payload)
 	if err != nil {
 		return err
@@ -324,9 +290,6 @@ func decodeYAMLViaJSON(payload []byte, dst any) error {
 	if len(payload) == 0 {
 		return errors.New("empty payload")
 	}
-	// Convert JSON to a generic value, re-emit as YAML, then YAML
-	// unmarshal into the destination. This keeps a single source of
-	// truth (YAML tags on the structs).
 	var anyVal any
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.UseNumber()
@@ -344,9 +307,6 @@ func decodeYAMLViaJSON(payload []byte, dst any) error {
 	return nil
 }
 
-// jsonNumberToYAML rewrites json.Number leaves into int64/float64 so
-// the subsequent YAML round-trip produces plain numeric scalars (and
-// custom YAML unmarshalers like BytesSize see the original form).
 func jsonNumberToYAML(v any) any {
 	switch x := v.(type) {
 	case map[string]any:

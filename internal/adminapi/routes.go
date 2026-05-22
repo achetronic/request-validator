@@ -2,6 +2,7 @@ package adminapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,64 +11,49 @@ import (
 	"github.com/swaggo/swag/v2"
 
 	_ "request-validator/internal/adminapi/docs" // self-register the generated OpenAPI 3.1 spec
-	"request-validator/internal/crdt"
+	"request-validator/internal/cluster"
 	"request-validator/internal/policy"
+	"request-validator/internal/state"
 )
 
-// registerRoutes wires every path on the admin API. Method matching is
-// done inside each handler so we can return a useful 405 on the wrong
-// verb without depending on a router.
+const adminMaxBodyBytes = 1 << 20
+
+func readBody(r *http.Request) ([]byte, error) {
+	if r.ContentLength > adminMaxBodyBytes {
+		return nil, fmt.Errorf("body too large")
+	}
+	buf, err := io.ReadAll(io.LimitReader(r.Body, adminMaxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) > adminMaxBodyBytes {
+		return nil, fmt.Errorf("body too large")
+	}
+	return buf, nil
+}
+
+// registerRoutes wires every path on the admin API.
 func (s *Server) registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/v1/groups", s.handleCollection(crdt.SectionGroups))
-	mux.HandleFunc("/api/v1/groups/", s.handleItem(crdt.SectionGroups))
+	mux.HandleFunc("/api/v1/groups", s.handleCollection(state.SectionGroups))
+	mux.HandleFunc("/api/v1/groups/", s.handleItem(state.SectionGroups))
 
-	mux.HandleFunc("/api/v1/facts", s.handleCollection(crdt.SectionFacts))
-	mux.HandleFunc("/api/v1/facts/", s.handleItem(crdt.SectionFacts))
+	mux.HandleFunc("/api/v1/facts", s.handleCollection(state.SectionFacts))
+	mux.HandleFunc("/api/v1/facts/", s.handleItem(state.SectionFacts))
 
-	mux.HandleFunc("/api/v1/defaults", s.handleRegister(crdt.SectionDefaults))
-	mux.HandleFunc("/api/v1/logging", s.handleRegister(crdt.SectionLogging))
+	mux.HandleFunc("/api/v1/defaults", s.handleRegister(state.SectionDefaults))
+	mux.HandleFunc("/api/v1/logging", s.handleRegister(state.SectionLogging))
 
 	mux.HandleFunc("/api/v1/config", s.handleConfig)
-	mux.HandleFunc("/api/v1/quarantine", s.handleQuarantineList)
-	mux.HandleFunc("/api/v1/quarantine/", s.handleQuarantineItem)
-
+	mux.HandleFunc("/api/v1/cluster", s.handleCluster)
 	mux.HandleFunc("/api/v1/openapi.json", s.handleOpenAPI)
 }
 
-// handleOpenAPI returns the generated OpenAPI 3.1 specification of
-// this admin API. The document is rendered by swaggo/swag v2 at build
-// time and embedded into internal/adminapi/docs via `make swagger`.
-func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	doc, err := swag.ReadDoc("swagger")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(doc))
-}
-
-// itemView is the JSON shape returned for a CRDT-managed entry.
+// itemView is the JSON shape returned for a single overlay entry.
 type itemView struct {
-	Name      string           `json:"name"`
-	Section   string           `json:"section"`
-	Stamp     crdt.Stamp       `json:"stamp"`
-	Payload   json.RawMessage  `json:"payload"`
-	Tombstone bool             `json:"tombstone,omitempty"`
-}
-
-func (s *Server) collectionMap(section string) *crdt.LWWMap {
-	switch section {
-	case crdt.SectionGroups:
-		return s.opts.Store.Groups
-	case crdt.SectionFacts:
-		return s.opts.Store.Facts
-	}
-	return nil
+	Name     string          `json:"name"`
+	Section  string          `json:"section"`
+	Revision state.Revision  `json:"revision"`
+	Payload  json.RawMessage `json:"payload"`
 }
 
 // handleCollection implements GET /api/v1/{groups,facts}.
@@ -77,17 +63,27 @@ func (s *Server) handleCollection(section string) http.HandlerFunc {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		m := s.collectionMap(section)
-		items := make([]itemView, 0)
-		m.Range(func(key string, e crdt.MapEntry) bool {
+		snap, err := s.opts.Store.Snapshot(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		entries := map[string]json.RawMessage{}
+		switch section {
+		case state.SectionGroups:
+			entries = snap.Groups
+		case state.SectionFacts:
+			entries = snap.Facts
+		}
+		items := make([]itemView, 0, len(entries))
+		for k, v := range entries {
 			items = append(items, itemView{
-				Name:    key,
-				Section: section,
-				Stamp:   e.Stamp,
-				Payload: e.Payload,
+				Name:     k,
+				Section:  section,
+				Revision: snap.Revision,
+				Payload:  v,
 			})
-			return true
-		})
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	}
 }
@@ -103,10 +99,16 @@ func (s *Server) handleItem(section string) http.HandlerFunc {
 		}
 		switch r.Method {
 		case http.MethodGet:
-			s.itemGet(w, section, name)
+			s.itemGet(w, r, section, name)
 		case http.MethodPut:
+			if !s.ensureLeaderOrRedirect(w, r) {
+				return
+			}
 			s.itemPut(w, r, section, name)
 		case http.MethodDelete:
+			if !s.ensureLeaderOrRedirect(w, r) {
+				return
+			}
 			s.itemDelete(w, r, section, name)
 		default:
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -114,25 +116,19 @@ func (s *Server) handleItem(section string) http.HandlerFunc {
 	}
 }
 
-func (s *Server) itemGet(w http.ResponseWriter, section, name string) {
-	m := s.collectionMap(section)
-	var entry crdt.MapEntry
-	var found bool
-	m.Range(func(key string, e crdt.MapEntry) bool {
-		if key == name {
-			entry = e
-			found = true
-			return false
+func (s *Server) itemGet(w http.ResponseWriter, r *http.Request, section, name string) {
+	entry, err := s.opts.Store.Get(r.Context(), section, name)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
 		}
-		return true
-	})
-	if !found {
-		writeError(w, http.StatusNotFound, "not found")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Etag", etagFor(entry.Stamp))
+	w.Header().Set("Etag", etagFor(entry.Revision))
 	writeJSON(w, http.StatusOK, itemView{
-		Name: name, Section: section, Stamp: entry.Stamp, Payload: entry.Payload,
+		Name: name, Section: section, Revision: entry.Revision, Payload: entry.Payload,
 	})
 }
 
@@ -142,8 +138,6 @@ func (s *Server) itemPut(w http.ResponseWriter, r *http.Request, section, name s
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Body must be a JSON object; we copy the "name" key from the path
-	// onto the payload so clients can omit it without ambiguity.
 	var asMap map[string]any
 	if err := json.Unmarshal(body, &asMap); err != nil {
 		writeError(w, http.StatusBadRequest, "body must be a JSON object")
@@ -169,57 +163,43 @@ func (s *Server) itemPut(w http.ResponseWriter, r *http.Request, section, name s
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	if want := parseIfMatch(r); want != nil {
-		_, ok, _ := s.collectionMap(section).Get(name, nil)
-		if ok {
-			// Compare against current stamp.
-			var current crdt.MapEntry
-			s.collectionMap(section).Range(func(key string, e crdt.MapEntry) bool {
-				if key == name {
-					current = e
-					return false
-				}
-				return true
-			})
-			if current.Stamp.TS != want.TS || current.Stamp.Node != want.Node {
-				writeError(w, http.StatusPreconditionFailed, "If-Match mismatch")
-				return
-			}
-		}
-	}
-
-	// Build a tentative snapshot with the new entry applied to a clone
-	// of the live map's data. We don't have a clone-store API, so we
-	// instead optimistically apply, validate, and on failure roll back
-	// by overwriting with the previous entry (or tombstoning if it
-	// didn't exist).
-	prevEntry, hadPrev := snapshotEntry(s.collectionMap(section), name)
-	stamp, err := putSectionRaw(s.opts.Store, section, name, normalised)
+	// Build a hypothetical snapshot with the new entry applied; if
+	// the merge fails we never touch the store.
+	snap, err := s.opts.Store.Snapshot(r.Context())
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	hypothetical := withEntry(snap, section, name, normalised)
+	if err := s.previewMerge(hypothetical); err != nil {
+		writeError(w, http.StatusBadRequest, "validation failed: "+err.Error())
 		return
 	}
 
-	snap := s.opts.Store.Snapshot()
-	if err := s.rebuildAndApply(snap, "admin "+section+" PUT "+name); err != nil {
-		// Quarantine and roll back.
-		s.opts.Quarantine.Push(section, name, err.Error())
-		rollbackSectionRaw(s.opts.Store, section, name, hadPrev, prevEntry)
-		writeError(w, http.StatusBadRequest, "rebuild failed: "+err.Error())
+	ifMatch := parseIfMatch(r)
+	rev, err := s.opts.Store.Put(r.Context(), section, name, normalised, ifMatch)
+	if err != nil {
+		switch {
+		case errors.Is(err, state.ErrConflict):
+			writeError(w, http.StatusPreconditionFailed, "If-Match did not match the current revision")
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
-	s.broadcast(crdt.Delta{
-		Section: section,
-		Key:     name,
-		Map: &crdt.MapEntry{
-			Stamp:   stamp,
-			Payload: normalised,
-		},
-	})
 
-	w.Header().Set("Etag", etagFor(stamp))
+	// The store watcher will trigger a rebuild on every replica; but
+	// to give the caller read-your-writes locally, we rebuild
+	// synchronously here too.
+	freshSnap, _ := s.opts.Store.Snapshot(r.Context())
+	if err := s.rebuildAndApply(freshSnap, "admin "+section+" PUT "+name); err != nil {
+		writeError(w, http.StatusInternalServerError, "applied to store but rebuild failed: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Etag", etagFor(rev))
 	writeJSON(w, http.StatusOK, itemView{
-		Name: name, Section: section, Stamp: stamp, Payload: normalised,
+		Name: name, Section: section, Revision: rev, Payload: normalised,
 	})
 }
 
@@ -227,39 +207,23 @@ func (s *Server) itemDelete(w http.ResponseWriter, r *http.Request, section, nam
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	if want := parseIfMatch(r); want != nil {
-		var current crdt.MapEntry
-		s.collectionMap(section).Range(func(key string, e crdt.MapEntry) bool {
-			if key == name {
-				current = e
-				return false
-			}
-			return true
-		})
-		if current.Stamp.TS != want.TS || current.Stamp.Node != want.Node {
-			writeError(w, http.StatusPreconditionFailed, "If-Match mismatch")
-			return
+	ifMatch := parseIfMatch(r)
+	if err := s.opts.Store.Delete(r.Context(), section, name, ifMatch); err != nil {
+		switch {
+		case errors.Is(err, state.ErrConflict):
+			writeError(w, http.StatusPreconditionFailed, "If-Match did not match the current revision")
+		case errors.Is(err, state.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not found")
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
 		}
-	}
-
-	prevEntry, hadPrev := snapshotEntry(s.collectionMap(section), name)
-	stamp := deleteSection(s.opts.Store, section, name)
-
-	snap := s.opts.Store.Snapshot()
-	if err := s.rebuildAndApply(snap, "admin "+section+" DELETE "+name); err != nil {
-		s.opts.Quarantine.Push(section, name, err.Error())
-		rollbackSectionRaw(s.opts.Store, section, name, hadPrev, prevEntry)
-		writeError(w, http.StatusBadRequest, "rebuild failed: "+err.Error())
 		return
 	}
-	s.broadcast(crdt.Delta{
-		Section: section,
-		Key:     name,
-		Map: &crdt.MapEntry{
-			Stamp:     stamp,
-			Tombstone: true,
-		},
-	})
+	freshSnap, _ := s.opts.Store.Snapshot(r.Context())
+	if err := s.rebuildAndApply(freshSnap, "admin "+section+" DELETE "+name); err != nil {
+		writeError(w, http.StatusInternalServerError, "applied to store but rebuild failed: "+err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -268,36 +232,35 @@ func (s *Server) handleRegister(section string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			reg := s.registerOf(section)
-			entry, ok := reg.Snapshot()
-			if !ok || entry.Cleared {
-				writeError(w, http.StatusNotFound, "not set via admin api")
+			entry, err := s.opts.Store.Get(r.Context(), section, "")
+			if err != nil {
+				if errors.Is(err, state.ErrNotFound) {
+					writeError(w, http.StatusNotFound, "not set via admin api")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			w.Header().Set("Etag", etagFor(entry.Stamp))
+			w.Header().Set("Etag", etagFor(entry.Revision))
 			writeJSON(w, http.StatusOK, map[string]any{
-				"section": section,
-				"stamp":   entry.Stamp,
-				"payload": json.RawMessage(entry.Payload),
+				"section":  section,
+				"revision": entry.Revision,
+				"payload":  json.RawMessage(entry.Payload),
 			})
 		case http.MethodPut:
+			if !s.ensureLeaderOrRedirect(w, r) {
+				return
+			}
 			s.registerPut(w, r, section)
 		case http.MethodDelete:
-			s.registerDelete(w, section)
+			if !s.ensureLeaderOrRedirect(w, r) {
+				return
+			}
+			s.registerDelete(w, r, section)
 		default:
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 	}
-}
-
-func (s *Server) registerOf(section string) *crdt.LWWRegister {
-	switch section {
-	case crdt.SectionDefaults:
-		return s.opts.Store.Defaults
-	case crdt.SectionLogging:
-		return s.opts.Store.Logging
-	}
-	return nil
 }
 
 func (s *Server) registerPut(w http.ResponseWriter, r *http.Request, section string) {
@@ -311,65 +274,66 @@ func (s *Server) registerPut(w http.ResponseWriter, r *http.Request, section str
 		writeError(w, http.StatusBadRequest, "body must be a JSON object")
 		return
 	}
+	payload, _ := json.Marshal(asMap)
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	reg := s.registerOf(section)
-	prevEntry, hadPrev := reg.Snapshot()
-
-	stamp, err := setRegister(s.opts.Store, section, asMap)
+	snap, err := s.opts.Store.Snapshot(r.Context())
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	hypothetical := withEntry(snap, section, "", payload)
+	if err := s.previewMerge(hypothetical); err != nil {
+		writeError(w, http.StatusBadRequest, "validation failed: "+err.Error())
 		return
 	}
 
-	snap := s.opts.Store.Snapshot()
-	if err := s.rebuildAndApply(snap, "admin "+section+" PUT"); err != nil {
-		s.opts.Quarantine.Push(section, "", err.Error())
-		rollbackRegister(reg, hadPrev, prevEntry)
-		writeError(w, http.StatusBadRequest, "rebuild failed: "+err.Error())
+	ifMatch := parseIfMatch(r)
+	rev, err := s.opts.Store.Put(r.Context(), section, "", payload, ifMatch)
+	if err != nil {
+		switch {
+		case errors.Is(err, state.ErrConflict):
+			writeError(w, http.StatusPreconditionFailed, "If-Match did not match the current revision")
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
-
-	payload, _ := json.Marshal(asMap)
-	s.broadcast(crdt.Delta{
-		Section: section,
-		Register: &crdt.RegisterEntry{
-			Stamp:   stamp,
-			Payload: payload,
-		},
-	})
-	w.Header().Set("Etag", etagFor(stamp))
+	freshSnap, _ := s.opts.Store.Snapshot(r.Context())
+	if err := s.rebuildAndApply(freshSnap, "admin "+section+" PUT"); err != nil {
+		writeError(w, http.StatusInternalServerError, "applied to store but rebuild failed: "+err.Error())
+		return
+	}
+	w.Header().Set("Etag", etagFor(rev))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"section": section,
-		"stamp":   stamp,
-		"payload": asMap,
+		"section":  section,
+		"revision": rev,
+		"payload":  asMap,
 	})
 }
 
-func (s *Server) registerDelete(w http.ResponseWriter, section string) {
+func (s *Server) registerDelete(w http.ResponseWriter, r *http.Request, section string) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-
-	reg := s.registerOf(section)
-	prevEntry, hadPrev := reg.Snapshot()
-	stamp := clearRegister(s.opts.Store, section)
-
-	snap := s.opts.Store.Snapshot()
-	if err := s.rebuildAndApply(snap, "admin "+section+" DELETE"); err != nil {
-		s.opts.Quarantine.Push(section, "", err.Error())
-		rollbackRegister(reg, hadPrev, prevEntry)
-		writeError(w, http.StatusBadRequest, "rebuild failed: "+err.Error())
+	ifMatch := parseIfMatch(r)
+	if err := s.opts.Store.Delete(r.Context(), section, "", ifMatch); err != nil {
+		switch {
+		case errors.Is(err, state.ErrConflict):
+			writeError(w, http.StatusPreconditionFailed, "If-Match did not match the current revision")
+		case errors.Is(err, state.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not set via admin api")
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
-	s.broadcast(crdt.Delta{
-		Section: section,
-		Register: &crdt.RegisterEntry{
-			Stamp:   stamp,
-			Cleared: true,
-		},
-	})
+	freshSnap, _ := s.opts.Store.Snapshot(r.Context())
+	if err := s.rebuildAndApply(freshSnap, "admin "+section+" DELETE"); err != nil {
+		writeError(w, http.StatusInternalServerError, "applied to store but rebuild failed: "+err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -380,11 +344,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	// We rebuild from the current YAML + CRDT instead of asking the
-	// engine for its installed Config, so the response always
-	// reflects what *would* serve right now (useful for debugging
-	// concurrent reloads).
-	cfg, err := policy.MergeFromYAML(s.opts.YAMLProvider(), s.opts.Store.Snapshot())
+	snap, err := s.opts.Store.Snapshot(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cfg, err := policy.MergeFromYAML(s.opts.YAMLProvider(), snap)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -392,20 +357,18 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, configView(cfg))
 }
 
-// configView projects *policy.Config into JSON-friendly maps, dropping
-// the compiled CEL programs and the facts registry.
 func configView(cfg *policy.Config) map[string]any {
 	groups := make([]map[string]any, 0, len(cfg.Groups))
 	for _, g := range cfg.Groups {
 		rules := make([]map[string]any, 0, len(g.Rules))
-		for _, r := range g.Rules {
+		for _, rl := range g.Rules {
 			rules = append(rules, map[string]any{
-				"name":        r.Name,
-				"description": r.Description,
-				"action":      r.Action,
-				"match":       r.Match,
-				"fallthrough": r.Fallthrough,
-				"dryRun":      r.DryRun,
+				"name":        rl.Name,
+				"description": rl.Description,
+				"action":      rl.Action,
+				"match":       rl.Match,
+				"fallthrough": rl.Fallthrough,
+				"dryRun":      rl.DryRun,
 			})
 		}
 		groups = append(groups, map[string]any{
@@ -427,160 +390,94 @@ func configView(cfg *policy.Config) map[string]any {
 	}
 }
 
-func (s *Server) handleQuarantineList(w http.ResponseWriter, r *http.Request) {
+// handleCluster returns who is leader, who am I, and other members.
+func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	var l cluster.Leader
+	standalone := true
+	if s.opts.Cluster != nil {
+		l = s.opts.Cluster.Leader()
+		standalone = s.opts.Cluster.Standalone()
+	} else {
+		// No cluster wired at all (test setup or pre-Bootstrap):
+		// behave as if we were the single replica.
+		l.Self = true
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": s.opts.Quarantine.List(),
+		"standalone": standalone,
+		"iAmLeader":  l.Self,
+		"leader": map[string]any{
+			"podName":    l.PodName,
+			"adminURL":   l.AdminURL,
+			"identity":   l.Identity,
+			"leaseUntil": l.LeaseUntil,
+		},
 	})
 }
 
-func (s *Server) handleQuarantineItem(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+// handleOpenAPI returns the generated OpenAPI 3.1 specification.
+func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/quarantine/")
-	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) == 0 || parts[0] == "" {
-		writeError(w, http.StatusBadRequest, "missing section")
-		return
-	}
-	section := parts[0]
-	key := ""
-	if len(parts) == 2 {
-		key = parts[1]
-	}
-	if !s.opts.Quarantine.Remove(section, key) {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// --- helpers ---
-
-// readBody reads at most adminMaxBodyBytes from the request body and
-// surfaces an explicit "body too large" error past that threshold so
-// callers see a deterministic 400 instead of a partial JSON.
-const adminMaxBodyBytes = 1 << 20
-
-func readBody(r *http.Request) ([]byte, error) {
-	if r.ContentLength > adminMaxBodyBytes {
-		return nil, fmt.Errorf("body too large")
-	}
-	// LimitReader returns one extra byte if the source produced more
-	// than the cap; we use that signal to convert overflow into a
-	// 400-friendly error rather than silently truncating.
-	buf, err := io.ReadAll(io.LimitReader(r.Body, adminMaxBodyBytes+1))
+	doc, err := swag.ReadDoc("swagger")
 	if err != nil {
-		return nil, err
-	}
-	if int64(len(buf)) > adminMaxBodyBytes {
-		return nil, fmt.Errorf("body too large")
-	}
-	return buf, nil
-}
-
-func snapshotEntry(m *crdt.LWWMap, key string) (crdt.MapEntry, bool) {
-	var out crdt.MapEntry
-	var found bool
-	m.Range(func(k string, e crdt.MapEntry) bool {
-		if k == key {
-			out = e
-			found = true
-			return false
-		}
-		return true
-	})
-	return out, found
-}
-
-func putSectionRaw(store *crdt.Store, section, name string, payload []byte) (crdt.Stamp, error) {
-	switch section {
-	case crdt.SectionGroups:
-		var v any
-		if err := json.Unmarshal(payload, &v); err != nil {
-			return crdt.Stamp{}, err
-		}
-		return store.PutGroup(name, v)
-	case crdt.SectionFacts:
-		var v any
-		if err := json.Unmarshal(payload, &v); err != nil {
-			return crdt.Stamp{}, err
-		}
-		return store.PutFact(name, v)
-	}
-	return crdt.Stamp{}, fmt.Errorf("unknown section %q", section)
-}
-
-func deleteSection(store *crdt.Store, section, name string) crdt.Stamp {
-	switch section {
-	case crdt.SectionGroups:
-		return store.DeleteGroup(name)
-	case crdt.SectionFacts:
-		return store.DeleteFact(name)
-	}
-	return crdt.Stamp{}
-}
-
-func rollbackSectionRaw(store *crdt.Store, section, name string, hadPrev bool, prev crdt.MapEntry) {
-	m := selectMap(store, section)
-	if m == nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if hadPrev {
-		m.PutRaw(name, prev)
-	} else {
-		// Insert a tombstone with the *current* (newer) stamp so the
-		// transient Put we made before failing is overwritten.
-		m.Delete(name, crdt.Stamp{TS: 1<<62, Node: store.Node()})
-	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(doc))
 }
 
-func selectMap(store *crdt.Store, section string) *crdt.LWWMap {
+// withEntry returns a copy of snap with the given section/key set to
+// payload. Used to build hypothetical snapshots for preview-merge.
+func withEntry(snap state.Snapshot, section, key string, payload json.RawMessage) state.Snapshot {
+	out := state.Snapshot{
+		Groups:   cloneMap(snap.Groups),
+		Facts:    cloneMap(snap.Facts),
+		Defaults: clone(snap.Defaults),
+		Logging:  clone(snap.Logging),
+		Revision: snap.Revision,
+	}
 	switch section {
-	case crdt.SectionGroups:
-		return store.Groups
-	case crdt.SectionFacts:
-		return store.Facts
+	case state.SectionGroups:
+		if out.Groups == nil {
+			out.Groups = map[string]json.RawMessage{}
+		}
+		out.Groups[key] = payload
+	case state.SectionFacts:
+		if out.Facts == nil {
+			out.Facts = map[string]json.RawMessage{}
+		}
+		out.Facts[key] = payload
+	case state.SectionDefaults:
+		out.Defaults = payload
+	case state.SectionLogging:
+		out.Logging = payload
 	}
-	return nil
+	return out
 }
 
-func setRegister(store *crdt.Store, section string, value any) (crdt.Stamp, error) {
-	switch section {
-	case crdt.SectionDefaults:
-		return store.SetDefaults(value)
-	case crdt.SectionLogging:
-		return store.SetLogging(value)
+func cloneMap(m map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(m) == 0 {
+		return nil
 	}
-	return crdt.Stamp{}, fmt.Errorf("unknown section %q", section)
+	out := make(map[string]json.RawMessage, len(m))
+	for k, v := range m {
+		out[k] = clone(v)
+	}
+	return out
 }
 
-func clearRegister(store *crdt.Store, section string) crdt.Stamp {
-	switch section {
-	case crdt.SectionDefaults:
-		return store.ClearDefaults()
-	case crdt.SectionLogging:
-		return store.ClearLogging()
+func clone(b []byte) []byte {
+	if b == nil {
+		return nil
 	}
-	return crdt.Stamp{}
-}
-
-func rollbackRegister(reg *crdt.LWWRegister, hadPrev bool, prev crdt.RegisterEntry) {
-	if hadPrev {
-		reg.SetRaw(prev)
-		return
-	}
-	reg.SetRaw(crdt.RegisterEntry{Stamp: crdt.Stamp{TS: 1<<62, Node: "_rollback"}, Cleared: true})
-}
-
-func (s *Server) broadcast(d crdt.Delta) {
-	if s.opts.Broadcaster == nil {
-		return
-	}
-	s.opts.Broadcaster.BroadcastDelta(d)
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
 }

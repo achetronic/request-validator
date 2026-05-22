@@ -1,0 +1,31 @@
+# Example: send Keycloak Dynamic Client Registration traffic through
+# the request-validator. The matched requests get forwarded to the
+# ext-authz provider declared in `meshConfig.extensionProviders`;
+# everything else stays on whatever AuthorizationPolicies you
+# already have.
+#
+# Replace the namespace, selector and the host / path matchers with
+# the ones your protected service uses.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: keycloak-dcr-ext-authz
+  namespace: keycloak              # namespace of the PROTECTED service
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  action: CUSTOM
+  provider:
+    # Must match the `name` declared in MeshConfig.extensionProviders.
+    name: request-validator
+  rules:
+    - to:
+        - operation:
+            hosts:
+              - auth.example-1.com
+              - auth.example-2.com
+            paths:
+              # Keycloak DCR endpoints.
+              - /realms/*/clients-registrations
+              - /realms/*/clients-registrations/*

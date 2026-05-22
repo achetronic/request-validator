@@ -17,6 +17,13 @@ whichever ref you chose.
 
 ## Deploying
 
+The repo ships a ready-to-apply example under
+[`examples/kubernetes/`](../examples/kubernetes/). It is the
+canonical reference for what a real deployment looks like (RBAC,
+Service, Deployment, PDB, Secret with token, policy ConfigMap, +
+Istio integration). Use it directly with `kubectl apply -k` or
+copy individual files into your own templating.
+
 We don't ship a Helm chart. Use whatever templating fits your cluster.
 A minimal [bjw-s/app-template](https://github.com/bjw-s-labs/helm-charts)
 `HelmRelease` looks like:
@@ -262,64 +269,91 @@ The previous policy stays active and the failure is logged at `ERROR`.
 - Bump the image tag; the readiness probe ensures the new pod loads
   the policy before traffic hits it.
 
-## Cluster mode (gossip + CRDT)
+## Cluster mode (Kubernetes Lease + ConfigMap)
 
-Enable replication by setting either `--cluster-peers` (comma-separated
-list of `host:port`) or `--cluster-discovery-dns` (a DNS name that
-resolves to all replica IPs, typically a Kubernetes headless Service).
-Without either flag the node runs standalone; the CRDT store still
-works locally but nothing leaves the process.
+Replication is automatic when the pod runs inside Kubernetes: the
+daemon discovers the API server through the in-cluster config,
+creates (or joins) a single ConfigMap holding the admin overlay,
+and elects a leader via a Lease in `coordination.k8s.io/v1`. No
+gossip ports, no static peer lists, no PVC.
 
-Required additions to the Deployment:
+Minimum RBAC for the pod's ServiceAccount:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: request-validator }
+rules:
+  # list+watch ConfigMaps in the namespace (informer needs this; the
+  # informer's field selector then narrows the cache to ours).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["request-validator-state"]
+    verbs: ["get", "update", "patch"]
+  # Same shape for the Lease used for leader election.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "watch", "create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["request-validator-leader"]
+    verbs: ["get", "update", "patch"]
+```
+
+Required Deployment additions (the rest is the standard ext-authz
+shape):
 
 ```yaml
 spec:
-  serviceName: request-validator-headless # for stable peer DNS
   template:
     spec:
+      serviceAccountName: request-validator
       containers:
         - name: main
           args:
             - --config=/etc/policy/policy.yaml
             - --admin-port=8081
             - --admin-token-file=/etc/rv/admin-token
-            - --cluster-bind=0.0.0.0:7946
-            - --cluster-discovery-dns=request-validator-headless.ns.svc.cluster.local
-            - --state-file=/var/lib/request-validator/state.json
+            # all other flags pick sensible defaults
           ports:
             - { name: extauthz, containerPort: 8080 }
             - { name: admin,    containerPort: 8081 }
-            - { name: gossip,   containerPort: 7946, protocol: UDP }
-            - { name: gossip-t, containerPort: 7946, protocol: TCP }
           volumeMounts:
-            - { name: state, mountPath: /var/lib/request-validator }
             - { name: admin-token, mountPath: /etc/rv, readOnly: true }
----
-apiVersion: v1
-kind: Service
-metadata: { name: request-validator-headless }
-spec:
-  clusterIP: None
-  selector: { app.kubernetes.io/name: request-validator }
-  ports:
-    - { name: gossip, port: 7946, protocol: UDP }
+            - { name: policy,      mountPath: /etc/policy, readOnly: true }
+      volumes:
+        - name: admin-token
+          secret:
+            secretName: request-validator-admin
+            items: [{ key: token, path: admin-token }]
+        - name: policy
+          configMap:
+            name: request-validator-policy
 ```
 
-A `PersistentVolumeClaim` for `/var/lib/request-validator` is
-recommended but not required: missing state on boot is recovered from
-peers via anti-entropy. The first boot of a brand-new cluster starts
-empty.
+The state ConfigMap (`request-validator-state` by default) is
+created automatically the first time a pod boots. **Do not** manage
+it from Git; it is owned by the running cluster.
 
-### Gossip operational notes
+### Operational notes
 
-- Convergence under normal load: 2-5 s for a single PUT to reach all
-  replicas in a 10-node cluster.
-- Memberlist needs **both** TCP and UDP on the bind port. Network
-  policies must allow both between replicas.
-- Use `--cluster-advertise=<pod-ip>:7946` if the pod IP differs from
-  the bind address (rare).
-- The state file is read on boot before gossip joins. If you suspect
-  drift, delete the file and restart; the node will re-sync from peers.
+- Convergence is sub-second under normal load: the leader writes the
+  ConfigMap, the API server returns the new `resourceVersion`, all
+  pods' informers receive the Update and rebuild their effective
+  config.
+- The Lease holds for ~15 s by default; on leader pod loss another
+  pod takes over within ~1-2 lease intervals. During that window,
+  writes get HTTP 503 with `Retry-After: 2`.
+- Total cluster restart (all pods at once): the ConfigMap survives
+  in etcd, so the first pod up reads it and serves traffic
+  immediately. The Lease may show a stale holder for one lease
+  duration before being claimed by whoever boots first.
+- For dev / bare-metal / `go run` use `--no-kubernetes`. Replication
+  is disabled but the admin API still works on top of an in-memory
+  store (optionally persisted via `--state-file`).
 
 ## Admin API
 
@@ -344,37 +378,36 @@ volumes:
 
 ```bash
 TOKEN=$(kubectl -n ns get secret request-validator-admin -o jsonpath='{.data.token}' | base64 -d)
-RV=http://127.0.0.1:8081
+RV=http://127.0.0.1:8081   # via `kubectl port-forward svc/request-validator 8081:8081`
 
-# Add a group via API
-curl -sf -X PUT "$RV/api/v1/groups/temporary-block" \
+# Add a group via API (works against any pod; followers redirect 307)
+curl -sLf -X PUT "$RV/api/v1/groups/temporary-block" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
         "priority": -100,
         "mode": "firstMatch",
         "action": "deny",
-        "rules": [{"name": "block-bad-ip", "match": "request.remote_ip == \"203.0.113.5\""}]
+        "rules": [{"name": "block-bad-ip", "match": "request.remoteIp == \"203.0.113.5\""}]
       }'
 
-# List effective config
-curl -sf -H "Authorization: Bearer $TOKEN" "$RV/api/v1/config" | jq .
+# Inspect the effective config
+curl -sLf -H "Authorization: Bearer $TOKEN" "$RV/api/v1/config" | jq .
 
-# Inspect quarantine on each replica
-for pod in $(kubectl -n ns get pod -l app=request-validator -o name); do
-  echo "## $pod"
-  kubectl -n ns exec "$pod" -- \
-    wget -qO- --header "Authorization: Bearer $TOKEN" \
-    "http://127.0.0.1:8081/api/v1/quarantine"
-done
+# See who is leader right now
+curl -sLf -H "Authorization: Bearer $TOKEN" "$RV/api/v1/cluster" | jq .
+
+# Fetch the OpenAPI 3.1 spec
+curl -sLf -H "Authorization: Bearer $TOKEN" "$RV/api/v1/openapi.json" > openapi.json
 ```
 
 ### Troubleshooting (cluster / admin)
 
 | Symptom                                      | First place to look                                                                  |
 | -------------------------------------------- | ------------------------------------------------------------------------------------ |
-| API write succeeds on one pod, not visible elsewhere | Wait 5 s; check `request_validator_gossip_*` metrics on the other pod         |
-| `quarantine` keeps growing on one node only  | That node is missing a fact the others have; check facts list and gossip latency     |
-| Memberlist log spam about "failed to join"   | DNS not resolving; verify the headless Service and pod DNS                           |
+| API write returns 307 over and over          | Client must follow redirects; use `curl -L` or set `If-Match` and retry              |
+| API write returns 503 `Retry-After: 2`       | No leader currently elected (typically lease transition). Wait and retry.            |
+| API write returns 412                        | Stale `If-Match`; `GET` again to read the fresh `Etag`                               |
+| Other pods don't reflect a write             | Check `kubectl get cm request-validator-state -o yaml`; is the change there?         |
+| Pod can't start: "forbidden: cannot create"  | RBAC missing the `coordination.k8s.io/leases create` or ConfigMap permissions        |
 | Admin port refuses connections               | `--admin-token-file` not set or unreadable; admin server is disabled by design       |
-| 412 Precondition Failed on a PUT             | Someone else (or you) raced; re-GET, re-apply with the new `Etag`                    |

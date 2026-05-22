@@ -260,12 +260,12 @@ Any of these makes `policy.LoadBytes` return an error. The caller
 (`cmd/main.go`) keeps the previous policy on a reload, or fails to
 start on initial boot.
 
-## Admin API (CRDT-backed overrides)
+## Admin API (overlay over the YAML)
 
 The same YAML grammar is accepted via a CRUD HTTP API on the admin
 port (default `8081`). Sections accepted: `groups`, `facts`,
-`defaults`, `logging`. Anything an admin API write produces is merged
-on top of the YAML; see ARCHITECTURE.md → "Effective config".
+`defaults`, `logging`. Anything an admin API write produces is
+merged on top of the YAML; see ARCHITECTURE.md → "Effective config".
 
 ### Auth
 
@@ -274,37 +274,51 @@ admin server is not started. The file is watched with fsnotify and
 re-read live; rotating the token never restarts the process. Requests
 without `Authorization: Bearer <token>` return 401.
 
+### Leader / follower
+
+Writes (PUT, DELETE) only succeed on the cluster leader. Followers
+reply with **HTTP 307 Temporary Redirect** and `Location` pointing
+at the leader's admin URL. Clients that follow redirects (curl `-L`,
+most HTTP libraries) handle this transparently. During Lease
+transitions where no leader is yet observed, writes return **HTTP
+503** with `Retry-After: 2`.
+
+Reads (GET) are served by any replica from its local informer
+cache.
+
 ### Endpoint reference
 
 | Method | Path                                  | Notes                                                  |
 | ------ | ------------------------------------- | ------------------------------------------------------ |
-| GET    | `/api/v1/groups`                      | list (`source: api` only)                              |
+| GET    | `/api/v1/groups`                      | list (overlay entries only)                            |
 | GET    | `/api/v1/groups/{name}`               | single                                                 |
-| PUT    | `/api/v1/groups/{name}`               | body identical to YAML group; `name` must match path   |
-| DELETE | `/api/v1/groups/{name}`               | tombstone; hides YAML-side homonym                     |
+| PUT    | `/api/v1/groups/{name}`               | body identical to YAML group; **leader-only**          |
+| DELETE | `/api/v1/groups/{name}`               | removes overlay; YAML group with same name returns     |
 | GET    | `/api/v1/facts[…]`                    | idem                                                   |
-| PUT    | `/api/v1/facts/{name}`                | URL facts spin up fetchers on next rebuild             |
-| GET    | `/api/v1/defaults`                    | current register (may be 404 if unset via API)         |
-| PUT    | `/api/v1/defaults`                    | entire defaults block; per-field merge with YAML       |
-| DELETE | `/api/v1/defaults`                    | clear; YAML defaults take effect again                 |
+| PUT    | `/api/v1/facts/{name}`                | URL facts spin up fetchers on next rebuild; leader-only |
+| DELETE | `/api/v1/facts/{name}`                | **leader-only**                                        |
+| GET    | `/api/v1/defaults`                    | current overlay (404 if unset)                         |
+| PUT    | `/api/v1/defaults`                    | per-field merge with YAML; **leader-only**             |
+| DELETE | `/api/v1/defaults`                    | clear; YAML defaults take effect again; leader-only    |
 | GET    | `/api/v1/logging`                     | idem                                                   |
-| PUT    | `/api/v1/logging`                     |                                                        |
-| DELETE | `/api/v1/logging`                     |                                                        |
+| PUT    | `/api/v1/logging`                     | **leader-only**                                        |
+| DELETE | `/api/v1/logging`                     | **leader-only**                                        |
 | GET    | `/api/v1/config`                      | effective config the engine is currently using         |
-| GET    | `/api/v1/quarantine`                  | items rejected during apply; with `reason`, `since`    |
-| DELETE | `/api/v1/quarantine/{section}/{name}` | drop a quarantined entry without further retry         |
+| GET    | `/api/v1/cluster`                     | who is leader, leader URL, lease until, standalone bool |
 | GET    | `/api/v1/openapi.json`                | generated OpenAPI 3.1 spec of this admin API           |
 
 ### Validation
 
-A PUT is rejected (400) with the validator error if the resulting
+A write is rejected (400) with the validator error if the resulting
 effective `*Config` would not compile (same checks as YAML load,
 including CEL compilation, duplicate names, fact references, etc.).
+The store is not mutated on failure.
 
 ### Optimistic concurrency
 
-Every response carries `Etag: "<ts>-<node>"`. PUTs accept `If-Match`;
-mismatch → 412.
+Every response carries `Etag` (the underlying ConfigMap's
+`resourceVersion` or, in standalone mode, a monotonic counter).
+Writes accept `If-Match`; mismatch → **412 Precondition Failed**.
 
 ### Errors that stop a write
 
@@ -314,13 +328,6 @@ In addition to the YAML-load errors above:
 - Body schema mismatch (unknown fields → 400 strict).
 - Validation of the merged config fails → 400 with the underlying error.
 - Token missing or wrong → 401.
+- Caller hit a follower → 307 with `Location: <leader admin URL>`.
 - `If-Match` mismatch → 412.
-
-### Quarantine
-
-When a gossiped delta lands on a node and the local rebuild fails (for
-example, a group referencing a fact this node hasn't seen yet), the
-offending key is stored in the local quarantine buffer and **not**
-applied to the live `*Config`. Every subsequent rebuild re-evaluates
-the buffer; items that now compile are integrated and removed. See
-ARCHITECTURE.md → "Quarantine".
+- No leader currently elected → 503 with `Retry-After: 2`.

@@ -201,52 +201,52 @@ mostly want to protect.
 
 ## Replication and admin API
 
-**CRDT**
-Conflict-free Replicated Data Type. A data structure whose merge
-operation is commutative, associative and idempotent, so replicas
-converge regardless of message order. We use two flavours: LWW-Map
-(for `groups`, `facts`) and LWW-Register (for `defaults`, `logging`).
+**Overlay**
+The bag of admin-managed values (groups, facts, defaults, logging)
+layered on top of the YAML at runtime. Lives in `internal/state.Store`.
 
-**LWW (Last-Write-Wins)**
-Conflict resolution by timestamp. The entry with the highest `ts`
-wins; ties are broken by lexicographic `nodeID`. Simple and adequate
-for an admin-rate write API; can lose concurrent writes to the same
-key (documented trade-off in D-015).
+**Store**
+The abstraction the admin API and the engine talk to. Two backends:
+`state/memory` (in-memory + optional JSON file) and `state/configmap`
+(Kubernetes ConfigMap with optimistic concurrency via
+`resourceVersion`).
 
-**Tombstone**
-A deletion marker kept in an LWW-Map, with `{ts, node, tombstone:true}`.
-Necessary so that an old `Put` arriving after the delete doesn't
-"resurrect" the entry. Garbage-collected after a TTL (default 24 h).
+**Revision**
+The opaque token a Store returns for every write. With the ConfigMap
+backend this is `metadata.resourceVersion`; with the in-memory
+backend it is a monotonic counter. Exposed to clients as an `Etag`
+and accepted on `If-Match` for conditional writes.
 
-**Node ID**
-The stable identifier of a replica inside the gossip cluster. Derived
-from hostname + a persisted UUID; used as the LWW tiebreaker and as
-the memberlist node name. Must NOT change across restarts.
+**Lease**
+The `coordination.k8s.io/v1.Lease` object used for leader election.
+The pod that successfully writes its identity into the Lease (and
+renews it within its lease duration) is the leader. Others wait.
 
-**Gossip**
-The epidemic-style protocol (`hashicorp/memberlist`) we use to
-propagate CRDT deltas between replicas. Each node periodically syncs
-with a few random peers; convergence is O(log N) rounds.
+**Holder identity**
+The string stamped into the Lease's `holderIdentity` field. In this
+project it is `<podName>|<adminURL>`, encoded so followers can read
+the leader's admin endpoint without an extra RPC.
 
-**Anti-entropy**
-The "push/pull" full-state digest exchange memberlist performs every
-~30 s. Recovers nodes that missed individual deltas.
+**Leader / Follower**
+The one pod that currently holds the Lease is the **leader** and is
+the only one that may write to the Store. All others are
+**followers**: they serve reads and reply with 307 Temporary
+Redirect on writes.
 
 **Effective config**
 The merged `*policy.Config` that the engine is actually evaluating:
-YAML overlaid with CRDT-managed overrides. Exposed via
+YAML overlaid with admin-managed overrides. Exposed via
 `GET /api/v1/config`.
 
 **Override (semantic)**
-The rule that API-managed values win over YAML-managed values for the
-same key. Applies uniformly to `groups`, `facts`, `defaults`,
+The rule that API-managed values win over YAML-managed values for
+the same key. Applies uniformly to `groups`, `facts`, `defaults`,
 `logging` (per-field in the singleton sections).
 
-**Quarantine**
-The local per-node buffer holding CRDT entries that arrived through
-gossip but fail to compile against this node's current state. Retried
-on every Config rebuild; surfaced via `GET /api/v1/quarantine`. Not
-gossiped between nodes.
+**Standalone mode**
+The fallback when no Kubernetes API is reachable (or `--no-kubernetes`
+is set). The admin API still works locally on top of the in-memory
+Store; replication and leader election are no-ops.
 
 **Admin port**
 The separate HTTP listener serving CRUD endpoints

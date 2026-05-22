@@ -1,401 +1,260 @@
-// Package cluster wraps hashicorp/memberlist to gossip CRDT deltas
-// between request-validator replicas.
+// Package cluster owns leader election among replicas via a
+// Kubernetes Lease. The admin API uses Leader() to decide whether
+// to accept a write locally or redirect to whoever currently holds
+// the Lease.
 //
-// The package is intentionally thin: memberlist owns peer discovery
-// (via seed peers or a periodic DNS resolve), failure detection and
-// the actual on-the-wire transport; cluster only translates between
-// memberlist's Delegate / Broadcast interfaces and the CRDT store.
+// In standalone mode (no Kubernetes available) Bootstrap returns a
+// degenerate Cluster whose Leader() always reports "self": writes
+// are accepted locally with no replication. That keeps the calling
+// code symmetric.
 //
-// Two integration points:
-//
-//   - `BroadcastDelta(d)` is invoked by the admin API on every
-//     successful local write. The delta is enqueued for retransmission
-//     to a small random subset of peers each gossip tick.
-//   - `LocalState` / `MergeRemoteState` (memberlist's anti-entropy
-//     push/pull) exchange the full FullState every ~30s so a node
-//     missing individual deltas eventually catches up.
-//
-// Deltas that fail to apply on the remote (validation, compile) end
-// up in the local quarantine.
+// The identity we publish into the Lease's HolderIdentity carries
+// the holder's admin address so followers can compute the Location
+// header for their 307 without an extra round-trip.
 package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/memberlist"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
-	"request-validator/internal/crdt"
 	"request-validator/internal/log"
-	rvmetrics "request-validator/internal/metrics"
 )
 
-// Options configures a cluster node.
+// Leader summarises who currently holds the Lease.
+type Leader struct {
+	// Self is true when this replica is the leader.
+	Self bool
+	// Identity is the HolderIdentity recorded in the Lease, in the
+	// form "<podName>|<adminURL>". Empty if no leader is observed.
+	Identity string
+	// PodName extracted from Identity (best-effort; empty in
+	// standalone mode or when the Identity does not parse).
+	PodName string
+	// AdminURL extracted from Identity (best-effort).
+	AdminURL string
+	// LeaseUntil is the latest moment the leader's lease is known
+	// to be valid (RenewTime + LeaseDuration on the API side).
+	LeaseUntil time.Time
+}
+
+// Cluster is the running leader election. Always non-nil after
+// Bootstrap returns; methods are safe to call concurrently.
+type Cluster struct {
+	standalone bool
+	selfPod    string
+	selfAdmin  string
+
+	leader atomic.Pointer[Leader]
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+// Options configure a Cluster.
 type Options struct {
-	// NodeName is the gossip identity of this replica. Must be stable
-	// across restarts (use hostname + persisted UUID).
-	NodeName string
+	// Client is the Kubernetes client used to take the Lease.
+	// Nil enables standalone mode.
+	Client kubernetes.Interface
 
-	// BindAddr is the host:port memberlist listens on. Both UDP and
-	// TCP on this port are required for gossip.
-	BindAddr string
+	// Namespace and LeaseName identify the Lease object.
+	Namespace string
+	LeaseName string
 
-	// AdvertiseAddr is the host:port other nodes should use to reach
-	// this one. Defaults to BindAddr when empty.
-	AdvertiseAddr string
+	// PodName is the human-readable identity (typically os.Hostname()
+	// inside k8s). Required even in standalone mode for log lines.
+	PodName string
 
-	// Peers is a static list of host:port seeds used at boot.
-	Peers []string
+	// AdminURL is "http://<podIP>:<adminPort>"; used by followers
+	// to compute the 307 Location header. Required when Client != nil.
+	AdminURL string
 
-	// DiscoveryDNS, when non-empty, is resolved periodically and any
-	// new IPs are joined. Intended for Kubernetes headless Services.
-	DiscoveryDNS string
+	// LeaseDuration / RenewDeadline / RetryPeriod follow client-go
+	// conventions. Sensible defaults are 15s / 10s / 2s.
+	LeaseDuration time.Duration
+	RenewDeadline time.Duration
+	RetryPeriod   time.Duration
 
-	// DiscoveryInterval governs DNS refresh frequency. Default 30s.
-	DiscoveryInterval time.Duration
-
-	// Store is the local CRDT store; deltas are applied here, and
-	// LocalState/MergeRemoteState use its Snapshot/MergeFull.
-	Store *crdt.Store
-
-	// OnApplyError, when non-nil, is invoked for every delta that
-	// applies to the CRDT layer but causes the downstream rebuild to
-	// fail. The caller typically pushes the offending key to its
-	// local quarantine.
-	OnApplyError func(d crdt.Delta, err error)
-
-	// OnDeltaApplied is invoked after a remote delta has been folded
-	// into the local store. Typically schedules a Config rebuild.
-	OnDeltaApplied func()
+	// OnLeaderChange is invoked whenever leadership transitions.
+	// Use it to log, to update metrics, or to trigger work that
+	// only the leader should do.
+	OnLeaderChange func(Leader)
 }
 
-// Node is a running cluster member.
-type Node struct {
-	opts Options
-	ml   atomic.Pointer[memberlist.Memberlist]
-
-	delegate *delegate
-	bq       *memberlist.TransmitLimitedQueue
-
-	dnsCancel context.CancelFunc
-	dnsWG     sync.WaitGroup
-}
-
-// New constructs a cluster node but does NOT start it. Call Start to
-// join.
-func New(opts Options) (*Node, error) {
-	if opts.NodeName == "" {
-		return nil, errors.New("cluster: NodeName required")
+// Bootstrap starts the election (or returns a standalone Cluster
+// when Client is nil) and blocks until either the election begins
+// running or an error occurs.
+func Bootstrap(ctx context.Context, opts Options) (*Cluster, error) {
+	c := &Cluster{
+		selfPod:   opts.PodName,
+		selfAdmin: opts.AdminURL,
 	}
-	if opts.BindAddr == "" {
-		return nil, errors.New("cluster: BindAddr required")
+	if opts.Client == nil {
+		c.standalone = true
+		// In standalone mode we are always the leader.
+		l := &Leader{Self: true, Identity: opts.PodName, PodName: opts.PodName, AdminURL: opts.AdminURL}
+		c.leader.Store(l)
+		if opts.OnLeaderChange != nil {
+			opts.OnLeaderChange(*l)
+		}
+		return c, nil
 	}
-	if opts.Store == nil {
-		return nil, errors.New("cluster: Store required")
+	if opts.Namespace == "" || opts.LeaseName == "" {
+		return nil, errors.New("cluster: Namespace and LeaseName are required")
 	}
-	if opts.DiscoveryInterval <= 0 {
-		opts.DiscoveryInterval = 30 * time.Second
+	if opts.PodName == "" {
+		return nil, errors.New("cluster: PodName is required")
 	}
-	return &Node{opts: opts}, nil
-}
+	if opts.AdminURL == "" {
+		return nil, errors.New("cluster: AdminURL is required")
+	}
+	if opts.LeaseDuration <= 0 {
+		opts.LeaseDuration = 15 * time.Second
+	}
+	if opts.RenewDeadline <= 0 {
+		opts.RenewDeadline = 10 * time.Second
+	}
+	if opts.RetryPeriod <= 0 {
+		opts.RetryPeriod = 2 * time.Second
+	}
 
-// Start configures memberlist, joins the cluster and spawns the
-// optional DNS discovery loop.
-func (n *Node) Start() error {
-	host, portStr, err := net.SplitHostPort(n.opts.BindAddr)
+	identity := encodeIdentity(opts.PodName, opts.AdminURL)
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta: metav1.ObjectMeta{
+			Name:      opts.LeaseName,
+			Namespace: opts.Namespace,
+		},
+		Client: opts.Client.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: identity,
+		},
+	}
+
+	cfg := leaderelection.LeaderElectionConfig{
+		Lock:            lock,
+		LeaseDuration:   opts.LeaseDuration,
+		RenewDeadline:   opts.RenewDeadline,
+		RetryPeriod:     opts.RetryPeriod,
+		ReleaseOnCancel: true,
+		Name:            "request-validator",
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(_ context.Context) {
+				l := &Leader{
+					Self:       true,
+					Identity:   identity,
+					PodName:    opts.PodName,
+					AdminURL:   opts.AdminURL,
+					LeaseUntil: time.Now().Add(opts.LeaseDuration),
+				}
+				c.leader.Store(l)
+				log.Infow("cluster: became leader", "pod", opts.PodName)
+				if opts.OnLeaderChange != nil {
+					opts.OnLeaderChange(*l)
+				}
+			},
+			OnStoppedLeading: func() {
+				// We may be still alive but lost the lease; flip our
+				// snapshot to "I am a follower" with an unknown
+				// identity until the next OnNewLeader fires.
+				l := &Leader{Self: false}
+				c.leader.Store(l)
+				log.Warnw("cluster: stopped leading", "pod", opts.PodName)
+				if opts.OnLeaderChange != nil {
+					opts.OnLeaderChange(*l)
+				}
+			},
+			OnNewLeader: func(newIdentity string) {
+				pod, admin := decodeIdentity(newIdentity)
+				self := newIdentity == identity
+				l := &Leader{
+					Self:       self,
+					Identity:   newIdentity,
+					PodName:    pod,
+					AdminURL:   admin,
+					LeaseUntil: time.Now().Add(opts.LeaseDuration),
+				}
+				c.leader.Store(l)
+				log.Infow("cluster: leader observed",
+					"leader_pod", pod, "leader_admin", admin, "self", self)
+				if opts.OnLeaderChange != nil {
+					opts.OnLeaderChange(*l)
+				}
+			},
+		},
+	}
+
+	le, err := leaderelection.NewLeaderElector(cfg)
 	if err != nil {
-		return fmt.Errorf("cluster: invalid bind addr %q: %w", n.opts.BindAddr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("cluster: invalid bind port %q: %w", portStr, err)
+		return nil, fmt.Errorf("cluster: new elector: %w", err)
 	}
 
-	cfg := memberlist.DefaultLANConfig()
-	cfg.Name = n.opts.NodeName
-	cfg.BindAddr = host
-	cfg.BindPort = port
-	cfg.AdvertisePort = port
-	if n.opts.AdvertiseAddr != "" {
-		ahost, aportStr, aerr := net.SplitHostPort(n.opts.AdvertiseAddr)
-		if aerr != nil {
-			return fmt.Errorf("cluster: invalid advertise addr %q: %w", n.opts.AdvertiseAddr, aerr)
-		}
-		ap, perr := strconv.Atoi(aportStr)
-		if perr != nil {
-			return fmt.Errorf("cluster: invalid advertise port %q: %w", aportStr, perr)
-		}
-		cfg.AdvertiseAddr = ahost
-		cfg.AdvertisePort = ap
-	}
-	cfg.LogOutput = newMemberlistLogShim()
-
-	d := &delegate{node: n}
-	cfg.Delegate = d
-	cfg.Events = d
-
-	ml, err := memberlist.Create(cfg)
-	if err != nil {
-		return fmt.Errorf("cluster: memberlist create: %w", err)
-	}
-	n.ml.Store(ml)
-	n.delegate = d
-	n.bq = &memberlist.TransmitLimitedQueue{
-		NumNodes:       func() int { return ml.NumMembers() },
-		RetransmitMult: 3,
-	}
-
-	if len(n.opts.Peers) > 0 {
-		if _, err := ml.Join(n.opts.Peers); err != nil {
-			log.Warnw("cluster: initial join had errors", "err", err.Error())
-		}
-	}
-	if n.opts.DiscoveryDNS != "" {
-		ctx, cancel := context.WithCancel(context.Background())
-		n.dnsCancel = cancel
-		n.dnsWG.Add(1)
-		go func() {
-			defer n.dnsWG.Done()
-			n.runDNSDiscovery(ctx)
-		}()
-	}
-	return nil
+	runCtx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		// LeaderElector.Run blocks; restart on context-cancellation
+		// is handled by the parent ctx.
+		le.Run(runCtx)
+	}()
+	return c, nil
 }
 
-// Stop leaves the cluster gracefully. Safe to call more than once;
-// subsequent calls are no-ops so test cleanups (and any
-// defer-on-error patterns in cmd/main.go) don't crash memberlist.
-func (n *Node) Stop() {
-	if n.dnsCancel != nil {
-		n.dnsCancel()
-		n.dnsCancel = nil
-	}
-	n.dnsWG.Wait()
-	if ml := n.ml.Swap(nil); ml != nil {
-		_ = ml.Leave(5 * time.Second)
-		_ = ml.Shutdown()
-	}
-}
-
-// LocalAddr returns the host:port this node is bound to (post-Start).
-func (n *Node) LocalAddr() string {
-	ml := n.ml.Load()
-	if ml == nil {
-		return ""
-	}
-	addr := ml.LocalNode().Addr.String()
-	port := ml.LocalNode().Port
-	return fmt.Sprintf("%s:%d", addr, port)
-}
-
-// Members returns the current peer list (alive only).
-func (n *Node) Members() []string {
-	ml := n.ml.Load()
-	if ml == nil {
-		return nil
-	}
-	out := make([]string, 0)
-	for _, m := range ml.Members() {
-		if m.State == memberlist.StateAlive {
-			out = append(out, fmt.Sprintf("%s/%s:%d", m.Name, m.Addr, m.Port))
-		}
-	}
-	return out
-}
-
-// BroadcastDelta enqueues a delta for gossip. Safe before Start: the
-// queue swallows the call silently when no transport is up yet.
-func (n *Node) BroadcastDelta(d crdt.Delta) {
-	if n.bq == nil {
+// Stop releases the Lease (when leader) and joins the background
+// goroutine.
+func (c *Cluster) Stop() {
+	if c == nil || c.standalone {
 		return
 	}
-	payload, err := json.Marshal(envelope{V: 1, Delta: &d})
-	if err != nil {
-		log.Warnw("cluster: encode delta failed", "err", err.Error())
-		return
+	if c.cancel != nil {
+		c.cancel()
 	}
-	n.bq.QueueBroadcast(&simpleBroadcast{payload: payload})
-	rvmetrics.GossipMessages.Inc(`direction="out",type="delta"`)
+	c.wg.Wait()
 }
 
-func (n *Node) runDNSDiscovery(ctx context.Context) {
-	t := time.NewTicker(n.opts.DiscoveryInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			peers := n.resolvePeers()
-			if len(peers) == 0 {
-				continue
-			}
-			ml := n.ml.Load()
-			if ml == nil {
-				continue
-			}
-			if _, err := ml.Join(peers); err != nil {
-				log.Warnw("cluster: DNS join error", "err", err.Error())
-			}
-		}
+// Leader returns the current view of the cluster. Cheap; safe from
+// the request hot path.
+func (c *Cluster) Leader() Leader {
+	if c == nil {
+		return Leader{}
 	}
+	if c.standalone {
+		return Leader{Self: true, PodName: c.selfPod, AdminURL: c.selfAdmin, Identity: c.selfPod}
+	}
+	if p := c.leader.Load(); p != nil {
+		return *p
+	}
+	return Leader{}
 }
 
-func (n *Node) resolvePeers() []string {
-	ips, err := net.LookupHost(n.opts.DiscoveryDNS)
-	if err != nil {
-		log.Warnw("cluster: DNS lookup failed",
-			"name", n.opts.DiscoveryDNS, "err", err.Error())
-		return nil
+// IsLeader is shorthand for Leader().Self.
+func (c *Cluster) IsLeader() bool { return c.Leader().Self }
+
+// Standalone reports whether the cluster runs without Kubernetes.
+func (c *Cluster) Standalone() bool {
+	if c == nil {
+		return true
 	}
-	_, portStr, _ := net.SplitHostPort(n.opts.BindAddr)
-	out := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		out = append(out, net.JoinHostPort(ip, portStr))
-	}
-	return out
+	return c.standalone
 }
 
-// envelope wraps a delta with a version byte so future schema bumps
-// stay backwards-compatible.
-type envelope struct {
-	V     int         `json:"v"`
-	Delta *crdt.Delta `json:"delta,omitempty"`
+func encodeIdentity(pod, adminURL string) string {
+	return pod + "|" + adminURL
 }
 
-type simpleBroadcast struct {
-	payload []byte
-}
-
-func (b *simpleBroadcast) Invalidates(memberlist.Broadcast) bool { return false }
-func (b *simpleBroadcast) Message() []byte                       { return b.payload }
-func (b *simpleBroadcast) Finished()                             {}
-
-// delegate fulfils memberlist's Delegate + EventDelegate interfaces.
-type delegate struct {
-	node *Node
-}
-
-func (d *delegate) NodeMeta(limit int) []byte             { return nil }
-func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte {
-	if d.node.bq == nil {
-		return nil
+func decodeIdentity(identity string) (pod, adminURL string) {
+	i := strings.IndexByte(identity, '|')
+	if i < 0 {
+		return identity, ""
 	}
-	return d.node.bq.GetBroadcasts(overhead, limit)
-}
-
-// NotifyMsg is called for user data sent by another node (broadcasts).
-func (d *delegate) NotifyMsg(buf []byte) {
-	if len(buf) == 0 {
-		return
-	}
-	rvmetrics.GossipMessages.Inc(`direction="in",type="delta"`)
-	cpy := make([]byte, len(buf))
-	copy(cpy, buf)
-	var env envelope
-	if err := json.Unmarshal(cpy, &env); err != nil {
-		log.Warnw("cluster: malformed gossip", "err", err.Error())
-		return
-	}
-	if env.V != 1 {
-		log.Warnw("cluster: unknown gossip version", "v", env.V)
-		return
-	}
-	if env.Delta == nil {
-		return
-	}
-	changed, err := d.node.opts.Store.ApplyDelta(*env.Delta)
-	if err != nil {
-		log.Warnw("cluster: bad delta", "err", err.Error())
-		if d.node.opts.OnApplyError != nil {
-			d.node.opts.OnApplyError(*env.Delta, err)
-		}
-		return
-	}
-	if changed && d.node.opts.OnDeltaApplied != nil {
-		d.node.opts.OnDeltaApplied()
-	}
-}
-
-// LocalState is invoked during anti-entropy push/pull; we send the
-// whole CRDT FullState so a peer that missed deltas catches up.
-func (d *delegate) LocalState(join bool) []byte {
-	state := d.node.opts.Store.Snapshot()
-	buf, _ := json.Marshal(state)
-	return buf
-}
-
-// MergeRemoteState applies a peer's full state on top of ours.
-func (d *delegate) MergeRemoteState(buf []byte, join bool) {
-	if len(buf) == 0 {
-		return
-	}
-	var state crdt.FullState
-	if err := json.Unmarshal(buf, &state); err != nil {
-		log.Warnw("cluster: bad remote state", "err", err.Error())
-		return
-	}
-	changed := d.node.opts.Store.MergeFull(state)
-	if changed > 0 && d.node.opts.OnDeltaApplied != nil {
-		d.node.opts.OnDeltaApplied()
-	}
-}
-
-func (d *delegate) NotifyJoin(n *memberlist.Node) {
-	log.Infow("cluster: peer joined", "name", n.Name, "addr", n.Address())
-	go d.updateMemberMetric()
-}
-func (d *delegate) NotifyLeave(n *memberlist.Node) {
-	log.Infow("cluster: peer left", "name", n.Name, "addr", n.Address())
-	go d.updateMemberMetric()
-}
-func (d *delegate) NotifyUpdate(n *memberlist.Node) { go d.updateMemberMetric() }
-
-func (d *delegate) updateMemberMetric() {
-	ml := d.node.ml.Load()
-	if ml == nil {
-		return
-	}
-	alive, suspect, dead, left := 0, 0, 0, 0
-	for _, m := range ml.Members() {
-		switch m.State {
-		case memberlist.StateAlive:
-			alive++
-		case memberlist.StateSuspect:
-			suspect++
-		case memberlist.StateDead:
-			dead++
-		case memberlist.StateLeft:
-			left++
-		}
-	}
-	rvmetrics.ClusterMembers.Set(`state="alive"`, int64(alive))
-	rvmetrics.ClusterMembers.Set(`state="suspect"`, int64(suspect))
-	rvmetrics.ClusterMembers.Set(`state="dead"`, int64(dead))
-	rvmetrics.ClusterMembers.Set(`state="left"`, int64(left))
-}
-
-// newMemberlistLogShim downgrades memberlist's stdlib-logger output to
-// our slog Debug level so we don't pollute INFO logs with peer churn.
-func newMemberlistLogShim() *memberlistLog {
-	return &memberlistLog{}
-}
-
-type memberlistLog struct{}
-
-func (m *memberlistLog) Write(p []byte) (int, error) {
-	line := strings.TrimSpace(string(p))
-	if line == "" {
-		return len(p), nil
-	}
-	log.Debugw("memberlist", "msg", line)
-	return len(p), nil
+	return identity[:i], identity[i+1:]
 }

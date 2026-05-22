@@ -18,16 +18,10 @@ import (
 var (
 	AdminRequests = newLabelled("request_validator_admin_requests_total",
 		"Admin API requests, labelled by method/path/status.")
-	GossipMessages = newLabelled("request_validator_gossip_messages_total",
-		"Gossip messages broken down by direction (in|out) and type.")
-	QuarantineSize = newGauge("request_validator_quarantine_size",
-		"Quarantined CRDT entries by section.")
 	Rebuilds = newLabelled("request_validator_rebuilds_total",
-		"Effective-Config rebuilds triggered, by source (yaml|sighup|crdt|gossip).")
+		"Effective-Config rebuilds triggered, by source (yaml|sighup|store).")
 	RebuildErrors = newCounter("request_validator_rebuild_errors_total",
 		"Effective-Config rebuilds that failed validation/compile.")
-	ClusterMembers = newGauge("request_validator_cluster_members",
-		"Cluster members observed by this node, by state.")
 )
 
 func newCounter(name, help string) *Counter {
@@ -98,7 +92,7 @@ func Render(w io.Writer) {
 		fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
 		fmt.Fprintf(w, "%s %d\n", c.name, c.val.Load())
 	}
-	for _, lc := range []*LabelledCounter{AdminRequests, GossipMessages, Rebuilds} {
+	for _, lc := range []*LabelledCounter{AdminRequests, Rebuilds} {
 		fmt.Fprintf(w, "# HELP %s %s\n", lc.name, lc.help)
 		fmt.Fprintf(w, "# TYPE %s counter\n", lc.name)
 		lc.mu.RLock()
@@ -111,23 +105,5 @@ func Render(w io.Writer) {
 			fmt.Fprintf(w, "%s{%s} %d\n", lc.name, k, lc.vals[k].Load())
 		}
 		lc.mu.RUnlock()
-	}
-	for _, g := range []*Gauge{QuarantineSize, ClusterMembers} {
-		fmt.Fprintf(w, "# HELP %s %s\n", g.name, g.help)
-		fmt.Fprintf(w, "# TYPE %s gauge\n", g.name)
-		g.mu.RLock()
-		keys := make([]string, 0, len(g.vals))
-		for k := range g.vals {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if k == "" {
-				fmt.Fprintf(w, "%s %d\n", g.name, g.vals[k])
-				continue
-			}
-			fmt.Fprintf(w, "%s{%s} %d\n", g.name, k, g.vals[k])
-		}
-		g.mu.RUnlock()
 	}
 }
