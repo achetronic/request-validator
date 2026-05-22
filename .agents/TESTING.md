@@ -56,7 +56,62 @@ becomes invisible.
 | `configwatch` | In-place write, save-via-rename, kubelet `..data` swap, debounce of bursts                                                      |
 | `facts`       | inline values, file source, URL fetch + refresh, URL fetch failure keeps previous value, validation (dupes, missing fields)     |
 | `httpserver`  | Allow/deny end-to-end, DCR body validation, hot-reload swap, access log (exclude/redact headers, query redact, console + json)  |
-| `policy`      | Evaluator (firstMatch / all / dryRun / fallthrough / action inheritance), example/policy.yaml flow, URL fact integration        |
+| `policy`      | Evaluator (firstMatch / all / dryRun / fallthrough / action inheritance / priority order), Merge(YAML+CRDT), URL fact integration |
+| `crdt`        | LWWMap put/delete/tombstone/merge associativity + idempotence, LWWRegister overwrite, Store snapshot stability, JSON persist + atomic rename |
+| `cluster`     | 2-3 in-process memberlist nodes on loopback: convergence of a PUT, eventual delivery after a node restart, anti-entropy fill-in |
+| `adminapi`    | CRUD per section, bearer auth (missing/invalid/rotated token), validation error → 400, If-Match, effective `/config`, quarantine list |
+| `quarantine`  | Push, retry on rebuild succeeds, retry still fails keeps entry, manual delete, no gossip leakage                                |
+
+## Replicated-logic tests
+
+For anything touching `cluster` or `crdt` convergence:
+
+```go
+// pseudo:
+n1 := startNode(t, ":0")
+n2 := startNode(t, ":0")
+n2.Join(n1.Addr())
+n1.Put("groups", "foo", grp)
+
+eventually(t, 2*time.Second, func() bool {
+    g, ok := n2.Snapshot().Groups["foo"]
+    return ok && g.Name == "foo"
+})
+```
+
+Use `t.TempDir()` for state files, random loopback ports for gossip,
+and a polling helper (not `time.Sleep`) to wait for convergence. All
+goroutines must be drained by `t.Cleanup`.
+
+## End-to-end tests (`internal/e2e`)
+
+Two layers, in the same package, gated by build tags:
+
+| Layer        | Tag      | What it boots             | Cost   | Run with                                |
+| ------------ | -------- | ------------------------- | ------ | --------------------------------------- |
+| in-process   | default  | two stacks in same proc   | ~15 s  | `go test ./internal/e2e/...`            |
+| binary-level | `e2e`    | `go build` + 2 subprocs   | ~5 s/test | `go test -tags e2e ./internal/e2e/...` or `make e2e` |
+
+The in-process layer (`harness_test.go` + `scenarios_test.go`) is part
+of the default test run; the binary layer (`binary_test.go`) is
+opt-in and runs under the `e2e` tag.
+
+Scenarios covered in both layers:
+
+- Admin PUT replicates via gossip.
+- ext-authz endpoint on the *other* node reflects a CRDT change
+  (allow → deny by IP, group delete restores allow, defaults overlay).
+- Missing-fact group is fail-closed at runtime (CEL is dynamic; no
+  compile-time rejection).
+- Cross-node convergence of fact + group combination.
+- Concurrent ext-authz requests during a burst of admin writes never
+  see a half-applied state.
+- Node restart with empty state recovers via anti-entropy push/pull.
+
+When you add a new admin endpoint or a new mutation path, add a
+matching scenario here. The in-process suite is fast enough to keep
+running on every push; the binary suite is the catch-all for flag
+wiring and signal handling.
 
 ## How to add a test
 

@@ -261,3 +261,120 @@ The previous policy stays active and the failure is logged at `ERROR`.
   newer binaries continue to accept old policies.
 - Bump the image tag; the readiness probe ensures the new pod loads
   the policy before traffic hits it.
+
+## Cluster mode (gossip + CRDT)
+
+Enable replication by setting either `--cluster-peers` (comma-separated
+list of `host:port`) or `--cluster-discovery-dns` (a DNS name that
+resolves to all replica IPs, typically a Kubernetes headless Service).
+Without either flag the node runs standalone; the CRDT store still
+works locally but nothing leaves the process.
+
+Required additions to the Deployment:
+
+```yaml
+spec:
+  serviceName: request-validator-headless # for stable peer DNS
+  template:
+    spec:
+      containers:
+        - name: main
+          args:
+            - --config=/etc/policy/policy.yaml
+            - --admin-port=8081
+            - --admin-token-file=/etc/rv/admin-token
+            - --cluster-bind=0.0.0.0:7946
+            - --cluster-discovery-dns=request-validator-headless.ns.svc.cluster.local
+            - --state-file=/var/lib/request-validator/state.json
+          ports:
+            - { name: extauthz, containerPort: 8080 }
+            - { name: admin,    containerPort: 8081 }
+            - { name: gossip,   containerPort: 7946, protocol: UDP }
+            - { name: gossip-t, containerPort: 7946, protocol: TCP }
+          volumeMounts:
+            - { name: state, mountPath: /var/lib/request-validator }
+            - { name: admin-token, mountPath: /etc/rv, readOnly: true }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: request-validator-headless }
+spec:
+  clusterIP: None
+  selector: { app.kubernetes.io/name: request-validator }
+  ports:
+    - { name: gossip, port: 7946, protocol: UDP }
+```
+
+A `PersistentVolumeClaim` for `/var/lib/request-validator` is
+recommended but not required: missing state on boot is recovered from
+peers via anti-entropy. The first boot of a brand-new cluster starts
+empty.
+
+### Gossip operational notes
+
+- Convergence under normal load: 2-5 s for a single PUT to reach all
+  replicas in a 10-node cluster.
+- Memberlist needs **both** TCP and UDP on the bind port. Network
+  policies must allow both between replicas.
+- Use `--cluster-advertise=<pod-ip>:7946` if the pod IP differs from
+  the bind address (rare).
+- The state file is read on boot before gossip joins. If you suspect
+  drift, delete the file and restart; the node will re-sync from peers.
+
+## Admin API
+
+Listens on `--admin-port` (default 8081). Required:
+
+- `--admin-token-file=/etc/rv/admin-token` containing a single token
+  string (newline trimmed). Without this flag, the admin server is
+  not started.
+- The token file is watched with fsnotify; rotation is live.
+
+Mount the token as a Secret:
+
+```yaml
+volumes:
+  - name: admin-token
+    secret:
+      secretName: request-validator-admin
+      items: [{ key: token, path: admin-token }]
+```
+
+### Common admin operations
+
+```bash
+TOKEN=$(kubectl -n ns get secret request-validator-admin -o jsonpath='{.data.token}' | base64 -d)
+RV=http://127.0.0.1:8081
+
+# Add a group via API
+curl -sf -X PUT "$RV/api/v1/groups/temporary-block" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "priority": -100,
+        "mode": "firstMatch",
+        "action": "deny",
+        "rules": [{"name": "block-bad-ip", "match": "request.remote_ip == \"203.0.113.5\""}]
+      }'
+
+# List effective config
+curl -sf -H "Authorization: Bearer $TOKEN" "$RV/api/v1/config" | jq .
+
+# Inspect quarantine on each replica
+for pod in $(kubectl -n ns get pod -l app=request-validator -o name); do
+  echo "## $pod"
+  kubectl -n ns exec "$pod" -- \
+    wget -qO- --header "Authorization: Bearer $TOKEN" \
+    "http://127.0.0.1:8081/api/v1/quarantine"
+done
+```
+
+### Troubleshooting (cluster / admin)
+
+| Symptom                                      | First place to look                                                                  |
+| -------------------------------------------- | ------------------------------------------------------------------------------------ |
+| API write succeeds on one pod, not visible elsewhere | Wait 5 s; check `request_validator_gossip_*` metrics on the other pod         |
+| `quarantine` keeps growing on one node only  | That node is missing a fact the others have; check facts list and gossip latency     |
+| Memberlist log spam about "failed to join"   | DNS not resolving; verify the headless Service and pod DNS                           |
+| Admin port refuses connections               | `--admin-token-file` not set or unreadable; admin server is disabled by design       |
+| 412 Precondition Failed on a PUT             | Someone else (or you) raced; re-GET, re-apply with the new `Etag`                    |

@@ -255,3 +255,278 @@ minimal `app-template` HelmRelease in the README.
 
 **Consequences.** One less moving part. Other deployers just use the
 image. The Helm release workflow was removed from `.github/workflows`.
+
+## D-014 - `priority` field per group; sort by `(priority asc, source order)`
+
+**Context.** Until now, groups were evaluated in YAML declaration
+order. Operators wanted finer-grained control without rewriting the
+file (e.g. "this allow-list must run before the catch-all", "this
+expensive check should run last"). The need became acute once we
+started accepting groups via an admin API: API-managed groups have no
+inherent ordering relative to the YAML ones.
+
+**Options considered.**
+
+- Keep declaration order; force operators to rewrite the YAML.
+- A `before:` / `after:` reference scheme (declarative).
+- A single integer `priority` with sort-by-ascending.
+
+**Decision.** Add `priority: int` to each group (default `0`).
+Evaluation order is `(priority asc, source order)`. Ties between YAML
+and API groups: YAML wins (declared first). Ties among API groups:
+lexicographic by `name` (since the API has no inherent order).
+
+**Reasoning.**
+
+- One integer field is trivial to learn, validate and serialise.
+- Negative values give a clean way to say "always first".
+- The tiebreaker rules make the order deterministic and observable
+  (you can print the resolved order from `GET /api/v1/config`).
+- `before:` / `after:` are powerful but invite cycles and forward-
+  references; rejected as over-engineering for a per-group ordering.
+
+**Consequences.**
+
+- `policy.Config.Groups` becomes a sorted slice after `LoadBytes` /
+  `Merge`; callers must never mutate it post-load.
+- The access log `rule` field is unchanged; only the iteration order
+  shifts.
+- Tests must assert evaluation order under mixed-priority fixtures.
+
+## D-015 - Admin CRUD API: gossip + CRDT, no external database
+
+**Context.** Operators needed to manage groups (and, by extension,
+facts / defaults / logging) at runtime without editing the ConfigMap.
+Requirements: stateless binary, no external DB, must scale to many
+replicas, must survive node restarts.
+
+**Options considered.**
+
+- **Raft (`hashicorp/raft` + BoltDB)** - strongly consistent, leader-
+  elected, durable. The "correct" answer for CRUD but adds discovery,
+  snapshots and 2-3 deps. Overkill for our write rate.
+- **Gossip + CRDT (`hashicorp/memberlist` + LWW-Map/Register)** -
+  eventually consistent, leaderless, deps already in the hashicorp
+  ecosystem we trust. Matches the project's "no locks on hot path"
+  ethos.
+- **Kubernetes ConfigMap as backing store** - delegates quorum to the
+  cluster but couples us tightly to k8s; 1 MiB limit; awkward for
+  high-cardinality groups.
+- **Embedded NATS JetStream / etcd** - too heavy.
+
+**Decision.** Gossip + CRDT.
+
+**Reasoning.** The admin API write rate is administrative
+(humans + CI), not transactional. Eventual consistency in the order of
+seconds is acceptable. Leaderless is operationally simpler (any replica
+serves writes). The whole subsystem is two new internal packages
+(`internal/cluster`, `internal/crdt`) and a state file; no external
+infrastructure.
+
+**Consequences.**
+
+- New deps: `github.com/hashicorp/memberlist` + its transitives.
+- Convergence is observable but not instant; operators must accept
+  this when writing tooling.
+- Last-write-wins can lose concurrent writes to the same key. For an
+  admin API this is acceptable; documented in OPERATIONS.md.
+- Each node persists the CRDT locally; full cluster restart from
+  scratch needs at least one node with a state file or peers.
+
+## D-016 - YAML is the floor, API overrides per key
+
+**Context.** Both the YAML config and the admin API can define
+`groups`, `facts`, `defaults`, `logging`. Conflict policy was needed.
+
+**Options considered.**
+
+- (a) API overrides YAML on a per-key basis. YAML keeps everything not
+  mentioned by API.
+- (b) YAML is immutable; the API may only add keys not present in YAML
+  (PUT on a YAML-defined key → 409).
+- (c) YAML is a one-time seed; subsequent operation is purely CRDT.
+
+**Decision.** (a) Override.
+
+**Reasoning.** Matches how operators expect "config + admin override"
+to behave in similar systems (Prometheus, Grafana provisioning + UI,
+k8s `kubectl edit` over a manifest). Keeps the YAML reviewable in Git
+while allowing emergency knobs. Option (b) creates surprising 409s;
+option (c) makes the YAML a lie after the first API write.
+
+**Consequences.**
+
+- `policy.Merge(yaml, crdt)` is total: every section has a defined
+  outcome for every conceivable input.
+- `GET /api/v1/config` returns the **effective** view so operators can
+  see what is actually serving.
+- Documentation must call out clearly that the API is "above" the
+  YAML; do not assume YAML rollback removes API-side state.
+
+## D-017 - Validation: every write validates the full merged `*Config`
+
+**Context.** A write touches one key, but a single key can break the
+whole config (a group's CEL refers to a fact that doesn't exist; a
+defaults block sets `denyStatus: -1`).
+
+**Options considered.**
+
+- Validate only the touched key in isolation.
+- Build a candidate `*Config` end-to-end and `compile + validate` it.
+  Reject the write if compilation fails.
+
+**Decision.** Validate end-to-end on every write.
+
+**Reasoning.** The invariant we want is: **the live `*Config` is
+always valid**. Isolated validation cannot preserve it. End-to-end
+validation is cheap at admin-write frequency.
+
+**Consequences.**
+
+- Writes are slightly slower (one full compile pass). Acceptable.
+- Most operator mistakes are caught at the API layer with a useful
+  400 error, instead of silently breaking traffic.
+
+## D-018 - CRDT mutation triggers the hot-reload code path
+
+**Context.** We already have a battle-tested rebuild + `atomic.Swap`
+flow for YAML reload (D-010, D-011). Admin API writes and gossip
+deltas could either reuse it or invent a new in-place mutation path.
+
+**Decision.** Reuse it. Any successful CRDT mutation (local or
+gossiped) schedules a debounced rebuild that goes through
+`Merge → validate → compile → Start → SetPolicy → oldCfg.Stop`.
+
+**Reasoning.**
+
+- One code path is one mental model, one set of failure modes, one
+  set of tests.
+- The atomic swap already handles in-flight requests correctly.
+- Facts with `method: url` get their goroutines stopped/restarted
+  cleanly on every rebuild without bespoke per-fact lifecycle code.
+
+**Consequences.**
+
+- A rebuild is more work than a surgical mutation. Mitigated by the
+  50 ms debounce on CRDT deltas, which coalesces bursts.
+- The CEL program cache (`Env.cache`) is rebuilt each time. Mitigated
+  by the same cache being source-keyed: unchanged expressions
+  re-compile only once and stay cached for the lifetime of that env.
+
+## D-019 - Quarantine for gossiped deltas that fail local validation
+
+**Context.** Eventually consistent systems can deliver deltas out of
+order. A group whose CEL references `facts.bar` might arrive at node B
+before the `facts.bar` PUT does. The merged config on B won't compile.
+
+**Options considered.**
+
+- Reject the delta silently with a `WARN`. Lose information; next
+  delta on any unrelated key triggers re-evaluation but the lost one
+  is gone.
+- Buffer the delta in a local **quarantine** and retry on every
+  subsequent rebuild. Surface it via `GET /api/v1/quarantine` so
+  operators can see what's stuck.
+- Force the writer to validate against an "expected state vector" and
+  reject if any node would diverge.
+
+**Decision.** Local quarantine with automatic retry on every rebuild;
+surfaced via the admin API; manual eviction with `DELETE`.
+
+**Reasoning.** Validators on different nodes inevitably disagree
+transiently (that's the whole point of eventual consistency). The
+quarantine is the explicit acknowledgement of that, with a recovery
+path. Operators can observe and act; the system is self-healing.
+
+**Consequences.**
+
+- `internal/quarantine` is a new package with its own tests.
+- Quarantine is *not* gossiped (each node's view can legitimately
+  differ). A `GET /api/v1/quarantine` is therefore per-node;
+  operators may need to query each replica when triaging.
+- The retry is cheap (it runs as part of the rebuild anyway), and
+  unbounded retention is fine because the buffer is small in practice.
+
+## D-020 - OpenAPI 3.1 spec generated from code via swaggo/swag v2
+
+**Context.** The admin API has 18 endpoints, four CRDT sections, an
+opinionated bearer-token auth scheme and a non-trivial set of error
+modes (validation, `If-Match`, quarantine). Operators and client
+authors need a machine-readable contract. Hand-writing and
+maintaining the spec by hand drifts in days.
+
+**Options considered.**
+
+- Hand-write `openapi.yaml` in `docs/` and gate PRs with a manual
+  diff review.
+- Generate from comments with [swaggo/swag v1] (OpenAPI 2.0 only).
+- Generate from comments with **swaggo/swag v2** (OpenAPI 3.1).
+- A different generator: `oapi-codegen` (schema-first), `huma`,
+  `goa` (DSL-first). Bigger surface, would require rewriting
+  handlers.
+
+**Decision.** swaggo/swag v2 with `--v3.1`, output committed to
+`internal/adminapi/docs/`. Spec served live at
+`GET /api/v1/openapi.json` behind the same bearer auth as the rest
+of the admin API. No Swagger UI in-tree: clients consume the JSON.
+
+**Reasoning.**
+
+- We already have the handlers; annotation-driven generation lets us
+  document them in place without rewriting.
+- swag v2 emits real OpenAPI 3.1 with proper `securitySchemes`,
+  `components.schemas` and `parameters`, which is what client
+  generators expect today.
+- Serving the spec behind the bearer matches AGENTS.md hard rule #7
+  ("admin API is fail-closed and isolated"): we don't leak the
+  admin schema to anonymous internet.
+- A `make swagger-check` CI step makes drift a build failure, so
+  the committed spec is always a faithful render of the code.
+
+**Consequences.**
+
+- Two new dev deps: the `swag` CLI (build-time only) and
+  `github.com/swaggo/swag/v2` (linked into the binary for the
+  embedded template + `swag.ReadDoc`).
+- Handlers use closure-style dispatch (`handleCollection(...)`
+  returns an `http.HandlerFunc`), which swag's parser cannot
+  introspect for individual paths. We pay for that with a small
+  `internal/adminapi/openapi.go` of doc-only stub functions; they
+  are never called and only exist for swag's comment-finder.
+- DTOs live in `internal/adminapi/dto.go`. Internal runtime types
+  (`policy.Group`, `crdt.MapEntry`, …) deliberately do **not** carry
+  swagger tags so the wire contract stays a single, reviewable file.
+- Regenerate with `make swagger`. CI verifies freshness via
+  `make swagger-check`.
+
+**Context.** Eventually consistent systems can deliver deltas out of
+order. A group whose CEL references `facts.bar` might arrive at node B
+before the `facts.bar` PUT does. The merged config on B won't compile.
+
+**Options considered.**
+
+- Reject the delta silently with a `WARN`. Lose information; next
+  delta on any unrelated key triggers re-evaluation but the lost one
+  is gone.
+- Buffer the delta in a local **quarantine** and retry on every
+  subsequent rebuild. Surface it via `GET /api/v1/quarantine` so
+  operators can see what's stuck.
+- Force the writer to validate against an "expected state vector" and
+  reject if any node would diverge.
+
+**Decision.** Local quarantine with automatic retry on every rebuild;
+surfaced via the admin API; manual eviction with `DELETE`.
+
+**Reasoning.** Validators on different nodes inevitably disagree
+transiently (that's the whole point of eventual consistency). The
+quarantine is the explicit acknowledgement of that, with a recovery
+path. Operators can observe and act; the system is self-healing.
+
+**Consequences.**
+
+- `internal/quarantine` is a new package with its own tests.
+- Quarantine is *not* gossiped (each node's view can legitimately
+  differ). A `GET /api/v1/quarantine` is therefore per-node;
+  operators may need to query each replica when triaging.
+- The retry is cheap (it runs as part of the rebuild anyway), and
+  unbounded retention is fine because the buffer is small in practice.

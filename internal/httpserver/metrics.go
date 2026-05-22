@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	rvmetrics "request-validator/internal/metrics"
 )
 
 // metrics holds simple counters exposed at /metrics in Prometheus text format.
@@ -87,6 +89,12 @@ func (m *metrics) handler() http.HandlerFunc {
 			fmt.Fprintf(w, "request_validator_rule_decisions_total{rule=%q,outcome=%q,dry_run=%q} %d\n",
 				k.rule, k.outcome, boolStr(k.dryRun), c.count.Load())
 		}
+
+		// Cluster / admin / quarantine counters live in
+		// internal/metrics so non-httpserver packages can update them
+		// without creating dependency cycles. Render them inline after
+		// the decision counters.
+		rvmetrics.Render(w)
 	}
 }
 

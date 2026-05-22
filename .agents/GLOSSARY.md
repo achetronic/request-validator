@@ -28,6 +28,11 @@ decision.
 - `all` - every rule must hold; one failure produces the opposite
   verdict.
 
+**Priority**
+An integer (positive, zero or negative) on each group. Smaller values
+are evaluated earlier. Ties are broken by source order (YAML before
+API). Default `0`.
+
 **Action**
 The verdict a rule (or group) produces when it matches: `allow` or
 `deny`. A rule inherits the group's action when it doesn't declare one.
@@ -193,3 +198,57 @@ against it.
 Dynamic Client Registration (RFC 7591). The Keycloak endpoint
 `POST /realms/<realm>/clients-registrations/openid-connect` we
 mostly want to protect.
+
+## Replication and admin API
+
+**CRDT**
+Conflict-free Replicated Data Type. A data structure whose merge
+operation is commutative, associative and idempotent, so replicas
+converge regardless of message order. We use two flavours: LWW-Map
+(for `groups`, `facts`) and LWW-Register (for `defaults`, `logging`).
+
+**LWW (Last-Write-Wins)**
+Conflict resolution by timestamp. The entry with the highest `ts`
+wins; ties are broken by lexicographic `nodeID`. Simple and adequate
+for an admin-rate write API; can lose concurrent writes to the same
+key (documented trade-off in D-015).
+
+**Tombstone**
+A deletion marker kept in an LWW-Map, with `{ts, node, tombstone:true}`.
+Necessary so that an old `Put` arriving after the delete doesn't
+"resurrect" the entry. Garbage-collected after a TTL (default 24 h).
+
+**Node ID**
+The stable identifier of a replica inside the gossip cluster. Derived
+from hostname + a persisted UUID; used as the LWW tiebreaker and as
+the memberlist node name. Must NOT change across restarts.
+
+**Gossip**
+The epidemic-style protocol (`hashicorp/memberlist`) we use to
+propagate CRDT deltas between replicas. Each node periodically syncs
+with a few random peers; convergence is O(log N) rounds.
+
+**Anti-entropy**
+The "push/pull" full-state digest exchange memberlist performs every
+~30 s. Recovers nodes that missed individual deltas.
+
+**Effective config**
+The merged `*policy.Config` that the engine is actually evaluating:
+YAML overlaid with CRDT-managed overrides. Exposed via
+`GET /api/v1/config`.
+
+**Override (semantic)**
+The rule that API-managed values win over YAML-managed values for the
+same key. Applies uniformly to `groups`, `facts`, `defaults`,
+`logging` (per-field in the singleton sections).
+
+**Quarantine**
+The local per-node buffer holding CRDT entries that arrived through
+gossip but fail to compile against this node's current state. Retried
+on every Config rebuild; surfaced via `GET /api/v1/quarantine`. Not
+gossiped between nodes.
+
+**Admin port**
+The separate HTTP listener serving CRUD endpoints
+(`/api/v1/...`), bearer-token-protected. Distinct from the ext-authz
+port to keep authentication boundaries clean.

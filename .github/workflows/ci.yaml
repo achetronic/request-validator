@@ -27,6 +27,17 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: install swag v2
+        run: go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
+
+      - name: openapi spec is up-to-date
+        run: |
+          # Regenerate to a scratch dir and diff against the committed one.
+          # Fails the build if the committed spec drifted from the source.
+          cp -r internal/adminapi/docs /tmp/docs-before
+          make swagger
+          diff -u /tmp/docs-before/swagger.json internal/adminapi/docs/swagger.json
+
       - name: go test
         run: go test -count=1 ./...
 
@@ -36,3 +47,6 @@ jobs:
       - name: build (smoke)
         run: |
           CGO_ENABLED=0 go build -buildvcs=false ./cmd
+
+      - name: e2e (binary)
+        run: make e2e

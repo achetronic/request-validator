@@ -29,6 +29,43 @@ test: ## go test
 race: ## go test -race
 	go test -race -count=1 ./...
 
+.PHONY: e2e
+e2e: ## Binary-level end-to-end tests (build tag e2e)
+	go test -tags e2e -timeout 5m -count=1 ./internal/e2e/...
+
+##@ OpenAPI
+
+SWAG ?= $(shell command -v swag 2>/dev/null)
+SWAG_DIRS = cmd,internal/adminapi,internal/crdt,internal/quarantine,internal/policy,internal/facts
+SWAG_OUT  = internal/adminapi/docs
+
+.PHONY: swagger-install
+swagger-install: ## Install swag v2 CLI locally (v2.0.0-rc5)
+	go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
+
+.PHONY: swagger
+swagger: ## Regenerate the OpenAPI 3.1 spec under internal/adminapi/docs
+	@if [ -z "$(SWAG)" ]; then \
+	  echo "swag not in PATH; run 'make swagger-install' first" >&2; \
+	  exit 1; \
+	fi
+	$(SWAG) init --v3.1 -g main.go -d $(SWAG_DIRS) --parseInternal \
+		--output $(SWAG_OUT) --outputTypes go,json
+
+.PHONY: swagger-check
+swagger-check: ## CI guard: fail if the committed openapi.json is out of date
+	@tmp=$$(mktemp -d); \
+	cp -r $(SWAG_OUT) $$tmp/before; \
+	$(MAKE) swagger >/dev/null; \
+	if ! diff -q $$tmp/before/swagger.json $(SWAG_OUT)/swagger.json >/dev/null; then \
+	  echo "ERROR: $(SWAG_OUT)/swagger.json is out of date; run 'make swagger' and commit." >&2; \
+	  diff -u $$tmp/before/swagger.json $(SWAG_OUT)/swagger.json | head -100 >&2; \
+	  cp -r $$tmp/before/. $(SWAG_OUT); \
+	  rm -rf $$tmp; \
+	  exit 1; \
+	fi; \
+	rm -rf $$tmp
+
 ##@ Build
 
 .PHONY: build

@@ -120,3 +120,38 @@ groups:
 		t.Fatalf("after swap expected 200, got %d", res.StatusCode)
 	}
 }
+
+func TestMetricsEndpointIncludesGlobalCounters(t *testing.T) {
+	// We don't need a real policy; just hit /metrics.
+	s := New(nil)
+	mux := newTestMuxFor(s)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	mux.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	// Lines that must be present because internal/metrics is rendered
+	// inline after the decision counters.
+	for _, want := range []string{
+		"request_validator_decisions_total{outcome=\"allow\"}",
+		"request_validator_admin_requests_total",
+		"request_validator_gossip_messages_total",
+		"request_validator_rebuild_errors_total",
+		"request_validator_quarantine_size",
+		"request_validator_cluster_members",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in /metrics, body=\n%s", want, body)
+		}
+	}
+}
+
+// newTestMuxFor builds a mux equivalent to Server.Run's registration
+// (used because Run() blocks).
+func newTestMuxFor(s *Server) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", s.metrics.handler())
+	return mux
+}

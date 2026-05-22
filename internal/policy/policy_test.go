@@ -325,3 +325,89 @@ groups:
 		}
 	}
 }
+
+func TestPriorityOrdering(t *testing.T) {
+	// Three groups declared with priorities that imply a different
+	// evaluation order than declaration order. Each rule matches the
+	// request, so the first group reached should win.
+	c := mustLoad(t, `
+defaults: { action: deny }
+groups:
+  - name: declared-first
+    priority: 10
+    action: deny
+    rules:
+      - name: always
+        match: "true"
+  - name: declared-second
+    priority: -5
+    action: allow
+    rules:
+      - name: always
+        match: "true"
+  - name: declared-third
+    priority: 0
+    action: deny
+    rules:
+      - name: always
+        match: "true"
+`)
+
+	// Expected order after sort: declared-second (-5), declared-third (0),
+	// declared-first (10). First match in declared-second is allow.
+	if got := c.Groups[0].Name; got != "declared-second" {
+		t.Fatalf("expected first group=declared-second, got %q", got)
+	}
+	if got := c.Groups[1].Name; got != "declared-third" {
+		t.Fatalf("expected second group=declared-third, got %q", got)
+	}
+	if got := c.Groups[2].Name; got != "declared-first" {
+		t.Fatalf("expected third group=declared-first, got %q", got)
+	}
+
+	d := ev(c, mkReq("GET", "h", "/", "", nil, ""))
+	if !d.Allowed || d.Rule != "declared-second/always" {
+		t.Fatalf("expected allow by declared-second/always, got %+v", d)
+	}
+}
+
+func TestPriorityTieKeepsDeclarationOrder(t *testing.T) {
+	c := mustLoad(t, `
+defaults: { action: deny }
+groups:
+  - name: a
+    priority: 0
+    action: allow
+    rules:
+      - name: any
+        match: "true"
+  - name: b
+    priority: 0
+    action: deny
+    rules:
+      - name: any
+        match: "true"
+`)
+	if c.Groups[0].Name != "a" || c.Groups[1].Name != "b" {
+		t.Fatalf("expected declaration order [a, b], got [%s, %s]",
+			c.Groups[0].Name, c.Groups[1].Name)
+	}
+	d := ev(c, mkReq("GET", "h", "/", "", nil, ""))
+	if !d.Allowed || d.Rule != "a/any" {
+		t.Fatalf("expected allow from a, got %+v", d)
+	}
+}
+
+func TestPriorityDefaultsToZero(t *testing.T) {
+	c := mustLoad(t, `
+defaults: { action: deny }
+groups:
+  - name: g
+    rules:
+      - name: any
+        match: "true"
+`)
+	if c.Groups[0].Priority != 0 {
+		t.Fatalf("expected default priority=0, got %d", c.Groups[0].Priority)
+	}
+}

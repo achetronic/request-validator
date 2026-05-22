@@ -111,6 +111,7 @@ that produces a verdict wins. If none decide, `defaults.action` applies.
 groups:
   - name: <identifier> # required, unique across groups
     description: ... # optional
+    priority: 0 # int (positive or negative), default 0; lower runs first
     mode: firstMatch | all # optional, default firstMatch
     action: allow | deny # optional, default allow; inherited by rules
     match: | # optional CEL expression (default: true)
@@ -122,6 +123,20 @@ groups:
 
 Group `match` is evaluated **once** per request. If false, the whole
 group is skipped silently.
+
+### Priority and ordering
+
+Groups are evaluated in ascending `priority` order. Smaller numbers
+(including negatives) run earlier. Ties are broken by the **order of
+declaration**, with YAML-defined groups preceding API-defined groups
+of equal priority. Reordering YAML keys reorders ties; reordering API
+PUTs does not (the API has no inherent order — equal priorities among
+API groups are broken by `name` lexicographically).
+
+`priority` is the right knob for "run this allow-list before the
+catch-all deny", "evaluate the cheap match first", etc. It replaces no
+existing semantics: a group whose `match` is false is still skipped
+regardless of priority.
 
 ### Modes
 
@@ -244,3 +259,68 @@ status code (200 = allow, anything else = deny).
 Any of these makes `policy.LoadBytes` return an error. The caller
 (`cmd/main.go`) keeps the previous policy on a reload, or fails to
 start on initial boot.
+
+## Admin API (CRDT-backed overrides)
+
+The same YAML grammar is accepted via a CRUD HTTP API on the admin
+port (default `8081`). Sections accepted: `groups`, `facts`,
+`defaults`, `logging`. Anything an admin API write produces is merged
+on top of the YAML; see ARCHITECTURE.md → "Effective config".
+
+### Auth
+
+Bearer token from a file (`--admin-token-file`). Without the flag the
+admin server is not started. The file is watched with fsnotify and
+re-read live; rotating the token never restarts the process. Requests
+without `Authorization: Bearer <token>` return 401.
+
+### Endpoint reference
+
+| Method | Path                                  | Notes                                                  |
+| ------ | ------------------------------------- | ------------------------------------------------------ |
+| GET    | `/api/v1/groups`                      | list (`source: api` only)                              |
+| GET    | `/api/v1/groups/{name}`               | single                                                 |
+| PUT    | `/api/v1/groups/{name}`               | body identical to YAML group; `name` must match path   |
+| DELETE | `/api/v1/groups/{name}`               | tombstone; hides YAML-side homonym                     |
+| GET    | `/api/v1/facts[…]`                    | idem                                                   |
+| PUT    | `/api/v1/facts/{name}`                | URL facts spin up fetchers on next rebuild             |
+| GET    | `/api/v1/defaults`                    | current register (may be 404 if unset via API)         |
+| PUT    | `/api/v1/defaults`                    | entire defaults block; per-field merge with YAML       |
+| DELETE | `/api/v1/defaults`                    | clear; YAML defaults take effect again                 |
+| GET    | `/api/v1/logging`                     | idem                                                   |
+| PUT    | `/api/v1/logging`                     |                                                        |
+| DELETE | `/api/v1/logging`                     |                                                        |
+| GET    | `/api/v1/config`                      | effective config the engine is currently using         |
+| GET    | `/api/v1/quarantine`                  | items rejected during apply; with `reason`, `since`    |
+| DELETE | `/api/v1/quarantine/{section}/{name}` | drop a quarantined entry without further retry         |
+| GET    | `/api/v1/openapi.json`                | generated OpenAPI 3.1 spec of this admin API           |
+
+### Validation
+
+A PUT is rejected (400) with the validator error if the resulting
+effective `*Config` would not compile (same checks as YAML load,
+including CEL compilation, duplicate names, fact references, etc.).
+
+### Optimistic concurrency
+
+Every response carries `Etag: "<ts>-<node>"`. PUTs accept `If-Match`;
+mismatch → 412.
+
+### Errors that stop a write
+
+In addition to the YAML-load errors above:
+
+- Path/body `name` mismatch → 400.
+- Body schema mismatch (unknown fields → 400 strict).
+- Validation of the merged config fails → 400 with the underlying error.
+- Token missing or wrong → 401.
+- `If-Match` mismatch → 412.
+
+### Quarantine
+
+When a gossiped delta lands on a node and the local rebuild fails (for
+example, a group referencing a fact this node hasn't seen yet), the
+offending key is stored in the local quarantine buffer and **not**
+applied to the live `*Config`. Every subsequent rebuild re-evaluates
+the buffer; items that now compile are integrated and removed. See
+ARCHITECTURE.md → "Quarantine".

@@ -129,7 +129,12 @@ groups:
   # too - see examples/config-for-istio.yaml for the `{*}` / `{**}` syntax.
 
   # Corporate Keycloak: DCR is never allowed here.
+  #
+  # `priority: -100` makes this group run before everything else, so the
+  # corporate-host deny short-circuits any later allow rule. Smaller
+  # numbers (including negatives) win; ties keep YAML declaration order.
   - name: dcr-corporate-deny
+    priority: -100
     action: deny
     rules:
       - name: block-corporate

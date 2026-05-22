@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -33,15 +34,21 @@ import (
 
 // Config is the top-level configuration loaded from YAML.
 type Config struct {
-	Defaults Defaults      `yaml:"defaults"`
-	Logging  Logging       `yaml:"logging"`
-	Facts    []facts.Spec  `yaml:"facts"`
-	Groups   []Group       `yaml:"groups"`
+	Defaults Defaults     `yaml:"defaults"`
+	Logging  Logging      `yaml:"logging"`
+	Facts    []facts.Spec `yaml:"facts"`
+	Groups   []Group      `yaml:"groups"`
 
 	// compiled state (set during Load)
 	env      *celenv.Env
 	registry *facts.Registry
 }
+
+// Group source identifiers used by Merge to break priority ties.
+const (
+	SourceYAML = "yaml"
+	SourceAPI  = "api"
+)
 
 // Defaults are server-wide knobs.
 type Defaults struct {
@@ -107,6 +114,12 @@ type Group struct {
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`
 
+	// Priority controls the relative evaluation order of groups. Smaller
+	// values are evaluated earlier (negatives allowed). Ties are broken by
+	// declaration order, with YAML-defined groups preceding API-defined
+	// groups of equal priority. Default 0.
+	Priority int `yaml:"priority"`
+
 	// Mode controls how the group composes its rules:
 	//   "firstMatch" (default): the first rule whose `match` is true decides.
 	//   "all":                  every rule must match; one failure denies.
@@ -122,6 +135,16 @@ type Group struct {
 
 	// Rules in declaration order.
 	Rules []Rule `yaml:"rules"`
+
+	// Source flags where the group originated. "yaml" (default) or "api"
+	// when the group was injected via the admin API. It is the secondary
+	// sort key for groups with equal Priority; YAML wins on ties.
+	Source string `yaml:"-"`
+
+	// declarationIndex preserves the original position of the group inside
+	// its source slice (the YAML document or the API submission order) so
+	// equal-priority groups stay deterministic after sorting.
+	declarationIndex int
 
 	// compiled state
 	matchProg cel.Program
@@ -197,6 +220,7 @@ func LoadBytes(b []byte) (*Config, error) {
 		return nil, fmt.Errorf("yaml: %w", err)
 	}
 	applyDefaults(c)
+	sortGroups(c)
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -272,6 +296,10 @@ func applyDefaults(c *Config) {
 	}
 	for gi := range c.Groups {
 		g := &c.Groups[gi]
+		if g.Source == "" {
+			g.Source = SourceYAML
+		}
+		g.declarationIndex = gi
 		if g.Mode == "" {
 			g.Mode = "firstMatch"
 		}
@@ -291,6 +319,32 @@ func applyDefaults(c *Config) {
 			}
 		}
 	}
+}
+
+// sortGroups orders Config.Groups by (priority asc, source order). Sources
+// other than YAML come after YAML at equal priority; within the same source
+// the original declaration order is preserved (the sort is stable). API
+// groups are expected to be lexicographically sorted by name by the caller
+// before invoking sortGroups, so equal-priority API entries are
+// deterministic too.
+func sortGroups(c *Config) {
+	sort.SliceStable(c.Groups, func(i, j int) bool {
+		a, b := c.Groups[i], c.Groups[j]
+		if a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
+		if a.Source != b.Source {
+			// YAML wins ties against any non-YAML source.
+			if a.Source == SourceYAML {
+				return true
+			}
+			if b.Source == SourceYAML {
+				return false
+			}
+			return a.Source < b.Source
+		}
+		return a.declarationIndex < b.declarationIndex
+	})
 }
 
 func (c *Config) validate() error {
