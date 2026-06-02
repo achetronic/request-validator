@@ -35,4 +35,4 @@ jobs:
 
       - name: build (smoke)
         run: |
-          CGO_ENABLED=0 go build -buildvcs=false ./cmd
+          CGO_ENABLED=0 go build -buildvcs=false -o /dev/null ./cmd
