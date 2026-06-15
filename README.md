@@ -182,10 +182,13 @@ to the next rule by default (`fallthrough: next`). Setting
 `fallthrough` to `allow` or `deny` short-circuits the group with that
 verdict.
 
-A rule can also be marked `dryRun: true`. It is still evaluated and
-logged exactly like a real rule, but a `deny` verdict it would
-produce is suppressed (the request goes through). Useful for trying a
-tightening in production before flipping it on.
+A rule can also be marked `dryRun: true`: it is evaluated and the verdict
+is recorded, but a `deny` is not enforced and the request goes through. The
+access log shows the verdict it produced (`decision: deny`) with
+`dry_run: true`, so you see what a tightening would block before flipping it
+on. Setting `defaults.dryRun: true` does the same for the whole policy at
+once: every request is evaluated, nothing is enforced, and the log and
+metrics report the verdict each request would have received.
 
 ## What CEL sees about a request
 
@@ -518,7 +521,7 @@ rule produced the verdict:
 | `x-rv-result`  | `allow` or `deny`                                           |
 | `x-rv-rule`    | rule that decided, formatted `group/rule` (or `<defaults>`) |
 | `x-rv-reason`  | short, human-readable reason                                |
-| `x-rv-dry-run` | `true` if the rule that decided was in shadow mode          |
+| `x-rv-dry-run` | `true` when enforcement was suppressed, by the deciding rule's `dryRun` or the global `defaults.dryRun` |
 
 Useful both during development and as a way for the protected service
 to log "this request was let through by rule X" if it wants to.

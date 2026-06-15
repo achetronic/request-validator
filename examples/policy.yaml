@@ -26,6 +26,7 @@ defaults:
   denyBody: "Forbidden"
   maxBodyBytes: 1MiB
   allowOnError: false
+  dryRun: false             # global shadow mode: evaluate, never enforce
 
 
 # Logging produces one structured access-log record per request, plus

@@ -6,16 +6,22 @@
 // inspect the request through our policy engine.
 //
 // Response contract:
-//   - 200 OK         -> request allowed (Envoy passes it through)
-//   - 4xx (default 403) -> request denied (Envoy returns the configured body)
-//   - 200 OK with x-rv-dry-run=true header -> rule marked dryRun: matched a
-//     deny rule but request was let through; useful for shadow testing.
+//   - 200 OK              -> request allowed; Envoy passes it through.
+//   - 4xx (default 403)   -> request denied; Envoy returns the configured body
+//     to the downstream client.
+//   - 200 OK + x-rv-dry-run:true + x-rv-result:deny
+//     -> the verdict was deny but enforcement is suppressed by dry-run mode,
+//     set per-rule with dryRun:true or globally with defaults.dryRun:true.
+//     Envoy still passes the request through, and operators can observe
+//     shadow denies in the access log and metrics before enabling enforcement.
 //
 // Diagnostic response headers (all prefixed `x-rv-`):
-//   x-rv-result      allow|deny
-//   x-rv-rule        name of the rule that decided (or "<defaults>")
-//   x-rv-reason      short explanation
-//   x-rv-dry-run     true|false
+//
+//	x-rv-result    allow|deny  the verdict the policy produced
+//	x-rv-rule      name of the rule that decided (or "<defaults>")
+//	x-rv-reason    short explanation
+//	x-rv-dry-run   true|false  true when enforcement is suppressed
+//	               (effectiveDry = defaults.dryRun OR the deciding rule's dryRun)
 package httpserver
 
 import (
@@ -110,9 +116,20 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, p.Defaults.MaxBodyBytes.Int64()))
 	if err != nil {
-		s.metrics.record("<read>", "error", false)
-		log.Errorw("read body failed", "err", err.Error())
-		s.deny(w, p, "<read>", "read body failed", false)
+		// Reading the body failed: the policy cannot be evaluated, so the
+		// default is fail-closed. Under global dry-run the request still passes
+		// through with HTTP 200 while the error is logged and counted.
+		s.metrics.record("<read>", "error", p.Defaults.DryRun)
+		log.Errorw("read body failed", "err", err.Error(), "dry_run", p.Defaults.DryRun)
+		w.Header().Set(hdrResult, "deny")
+		if p.Defaults.DryRun {
+			w.Header().Set(hdrDry, "true")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set(hdrDry, "false")
+		w.WriteHeader(p.Defaults.DenyStatus)
+		_, _ = w.Write([]byte(p.Defaults.DenyBody))
 		return
 	}
 
@@ -129,36 +146,50 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	d := p.Evaluate(r.Context(), req)
 
+	// effectiveDry is true when enforcement should be suppressed: either the
+	// global switch is on (defaults.dryRun) or the deciding rule is dryRun.
+	effectiveDry := p.Defaults.DryRun || d.DryRun
+
+	// Diagnostic response headers, set before WriteHeader.
 	w.Header().Set(hdrRule, d.Rule)
 	w.Header().Set(hdrReason, d.Reason)
-	if d.DryRun {
+	w.Header().Set(hdrResult, verdictLabel(d.Allowed))
+	if effectiveDry {
 		w.Header().Set(hdrDry, "true")
 	} else {
 		w.Header().Set(hdrDry, "false")
 	}
 
-	if d.Allowed {
-		s.metrics.record(d.Rule, "allow", d.DryRun)
-		w.Header().Set(hdrResult, "allow")
+	// Record exactly one decision metric per evaluated request. The outcome
+	// is the verdict the policy produced; dry_run reflects effectiveDry so
+	// both per-rule and global dry-run show up consistently in the
+	// time-series.
+	s.metrics.record(d.Rule, verdictLabel(d.Allowed), effectiveDry)
+
+	// Enforce (or shadow) the decision.
+	if d.Allowed || effectiveDry {
+		// Real allow, or dry-run suppression: Envoy passes the request through.
 		w.WriteHeader(http.StatusOK)
 	} else {
-		s.deny(w, p, d.Rule, d.Reason, d.DryRun)
+		// Real deny, not shadowed: Envoy returns the configured error.
+		w.WriteHeader(p.Defaults.DenyStatus)
+		_, _ = w.Write([]byte(p.Defaults.DenyBody))
 	}
 
-	// One access-log record per request. Level mirrors the verdict.
+	// One access-log record per request. Log level mirrors the verdict:
+	// WARN for deny including shadow denies so they stand out, INFO for allow.
 	logger := log.Logger()
 	rec := []any{
 		"decision", verdictLabel(d.Allowed),
 		"rule", d.Rule,
 		"reason", d.Reason,
-		"dry_run", d.DryRun,
+		"dry_run", effectiveDry,
 		"duration_ms", float64(time.Since(start).Microseconds()) / 1000.0,
 		accessLogAttrs(req, p.Logging),
 	}
-	switch {
-	case d.Allowed:
+	if d.Allowed {
 		logger.Info("request decided", rec...)
-	default:
+	} else {
 		logger.Warn("request decided", rec...)
 	}
 }
@@ -168,13 +199,6 @@ func verdictLabel(allowed bool) string {
 		return "allow"
 	}
 	return "deny"
-}
-
-func (s *Server) deny(w http.ResponseWriter, p *policy.Config, rule, reason string, dryRun bool) {
-	s.metrics.record(rule, "deny", dryRun)
-	w.Header().Set(hdrResult, "deny")
-	w.WriteHeader(p.Defaults.DenyStatus)
-	_, _ = w.Write([]byte(p.Defaults.DenyBody))
 }
 
 func clientIP(r *http.Request) string {

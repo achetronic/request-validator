@@ -255,3 +255,31 @@ minimal `app-template` HelmRelease in the README.
 
 **Consequences.** One less moving part. Other deployers just use the
 image. The Helm release workflow was removed from `.github/workflows`.
+
+## D-014 - Global dry-run switch
+
+**Context.** Operators want to preview a whole policy against live traffic
+before it can block anything. A per-rule `dryRun` already covers single
+rules, but it suppresses the verdict inside the evaluator, so the access log
+records `allow` for a rule that would deny. That hides what the operator
+needs to see, and shadowing a whole policy means setting `dryRun` on every
+rule.
+
+**Decision.** Add `defaults.dryRun` (bool, default `false`). Enforcement
+suppression lives in the `httpserver` layer; the evaluator returns the
+verdict the policy produced. `dry_run` carries one meaning everywhere:
+evaluated but not enforced, whether set per-rule or globally. A shadowed deny
+is logged at `WARN` with `decision: deny` and `dry_run: true`. Under global
+dry-run a body-read failure also passes through with HTTP 200. YAML only, no
+CLI flag.
+
+**Reasoning.** Decoupling the verdict from its enforcement keeps the
+evaluator pure and lets the access log and metrics report what a policy
+would do. The server layer already owns the HTTP response, so the
+suppression check belongs there.
+
+**Consequences.** A per-rule `dryRun` deny is logged with `decision: deny` at
+`WARN`. Shadow denies are queryable in metrics as
+`request_validator_rule_decisions_total{outcome="deny",dry_run="true"}`. One
+decision metric per request, with `dry_run` reflecting whether enforcement
+was suppressed.

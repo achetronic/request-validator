@@ -60,6 +60,13 @@ type Defaults struct {
 
 	// AllowOnError: if true, evaluation errors produce allow; else deny.
 	AllowOnError bool `yaml:"allowOnError"`
+
+	// DryRun is the global shadow switch: the service evaluates every request
+	// normally but never enforces a deny. All requests pass through to Envoy
+	// with HTTP 200, while the access log and metrics record the real verdict
+	// so an operator can observe what would be denied before enabling
+	// enforcement. Default false.
+	DryRun bool `yaml:"dryRun"`
 }
 
 // Logging configures the access-log enrichment applied to every request.
@@ -413,7 +420,7 @@ func (c *Config) evalGroup(ctx context.Context, g *Group, requestVar, factsVar m
 				// Group fails. Emit the opposite of the group action.
 				groupAllow := g.Action == "allow"
 				return Decision{
-					Allowed: !groupAllow || r.DryRun,
+					Allowed: !groupAllow,
 					Rule:    g.Name + "/" + r.Name,
 					Reason:  fmt.Sprintf("group mode=all: rule %q failed", r.Name),
 					DryRun:  r.DryRun,
@@ -436,7 +443,7 @@ func (c *Config) evalGroup(ctx context.Context, g *Group, requestVar, factsVar m
 			}
 			if ok {
 				return Decision{
-					Allowed: r.effectiveAction == "allow" || r.DryRun,
+					Allowed: r.effectiveAction == "allow",
 					Rule:    g.Name + "/" + r.Name,
 					Reason:  "matched",
 					DryRun:  r.DryRun,
@@ -449,7 +456,7 @@ func (c *Config) evalGroup(ctx context.Context, g *Group, requestVar, factsVar m
 			case "allow":
 				return Decision{Allowed: true, Rule: g.Name + "/" + r.Name, Reason: "no match -> fallthrough allow", DryRun: r.DryRun}, true
 			case "deny":
-				return Decision{Allowed: r.DryRun, Rule: g.Name + "/" + r.Name, Reason: "no match -> fallthrough deny", DryRun: r.DryRun}, true
+				return Decision{Allowed: false, Rule: g.Name + "/" + r.Name, Reason: "no match -> fallthrough deny", DryRun: r.DryRun}, true
 			}
 		}
 		return Decision{}, false

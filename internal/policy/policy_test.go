@@ -136,12 +136,68 @@ groups:
         dryRun: true
         match: "request.path.startsWith('/forbidden')"
 `)
+	// Evaluate returns the deny verdict with DryRun=true; enforcement
+	// suppression is the httpserver layer's responsibility.
 	d := ev(c, mkReq("GET", "x", "/forbidden/x", "", nil, ""))
-	if !d.Allowed {
-		t.Fatalf("dryRun must allow: %+v", d)
+	if d.Allowed {
+		t.Fatalf("Evaluate must return real deny verdict for dryRun rule: %+v", d)
 	}
 	if !d.DryRun {
-		t.Fatalf("dryRun flag missing: %+v", d)
+		t.Fatalf("DryRun flag must be set: %+v", d)
+	}
+	// Non-matching path: no rule fires, falls through to defaults (allow).
+	d2 := ev(c, mkReq("GET", "x", "/safe", "", nil, ""))
+	if !d2.Allowed {
+		t.Fatalf("non-matching path should reach defaults allow: %+v", d2)
+	}
+	if d2.DryRun {
+		t.Fatalf("non-matching path should not carry DryRun flag: %+v", d2)
+	}
+}
+
+func TestDefaultsDryRunField(t *testing.T) {
+	cases := []struct {
+		name   string
+		src    string
+		want   bool
+	}{
+		{"dryRun true", `
+defaults:
+  action: deny
+  dryRun: true
+groups:
+  - name: g
+    rules:
+      - name: r
+        match: "true"
+`, true},
+		{"dryRun false explicit", `
+defaults:
+  action: deny
+  dryRun: false
+groups:
+  - name: g
+    rules:
+      - name: r
+        match: "true"
+`, false},
+		{"dryRun omitted defaults false", `
+defaults:
+  action: deny
+groups:
+  - name: g
+    rules:
+      - name: r
+        match: "true"
+`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := mustLoad(t, tc.src)
+			if c.Defaults.DryRun != tc.want {
+				t.Fatalf("Defaults.DryRun = %v, want %v", c.Defaults.DryRun, tc.want)
+			}
+		})
 	}
 }
 
@@ -223,9 +279,9 @@ func TestExampleConfigFlow(t *testing.T) {
 			dcr(mcpBody, "13.65.138.115"), false, "<defaults>"},
 
 		// Mistral, declared as dryRun in the example.
-		// The dryRun rule logs but should never produce an "allow" verdict -
-		// because the placeholder CIDR 0.0.0.0/32 doesn't match any source,
-		// no decision is produced; defaults deny applies.
+		// The group match guard (`facts.mistralFeed != null && ...`) is false
+		// because the feed is never started in unit tests, so the group is
+		// skipped entirely and defaults deny applies.
 		{"mistral placeholder not matched", dcr(mcpBody, "1.2.3.4"),
 			false, "<defaults>"},
 

@@ -25,6 +25,7 @@ defaults:
   denyBody: "Forbidden" # string                   default: "Forbidden"
   maxBodyBytes: 1MiB # BytesSize                default: 1MiB
   allowOnError: false # bool                     default: false
+  dryRun: false # bool                     default: false
 ```
 
 `BytesSize` accepts plain integers (bytes) and human strings:
@@ -33,6 +34,12 @@ defaults:
 `allowOnError` flips the default fail-closed behaviour: when a CEL
 evaluation hits an error mid-request, the verdict becomes `allow`
 instead of `deny`. Used rarely, with care.
+
+`dryRun` enables global shadow mode. When true, the service evaluates every
+rule as normal but never enforces a deny; requests always return HTTP 200.
+The access log and metrics record the verdict the policy produced. A failure
+reading the request body normally fail-closes; under global `dryRun` it also
+passes through with HTTP 200.
 
 ## `logging`
 
@@ -149,9 +156,9 @@ group is skipped silently.
 - `fallthrough` controls what happens in a `firstMatch` group when this
   rule's `match` is false: `next` tries the next rule; `allow`/`deny`
   short-circuits with that verdict.
-- `dryRun: true` evaluates and logs the rule, but suppresses a `deny`
-  decision (request is allowed through). The access log carries
-  `dry_run: true` so an operator can see what _would_ have been denied.
+- `dryRun: true` enables shadow mode for the rule. The evaluator produces the
+  verdict and the access log and metrics record it with `dry_run: true`,
+  while enforcement is suppressed.
 
 ### Decision flow (pseudo-code)
 
@@ -162,7 +169,7 @@ for each group in order:
         case firstMatch:
             for each rule in order:
                 if rule.match is true:
-                    return decision(rule.action XOR dryRun)
+                    return decision(rule.action)
                 else: apply rule.fallthrough
         case all:
             for each rule in order:
@@ -213,8 +220,14 @@ reference:
 }
 ```
 
-`rule == "<defaults>"` means no group produced a verdict and the
-`defaults.action` fired.
+- `decision` always reflects the verdict the policy produced, even when shadow
+  mode suppresses enforcement.
+- `dry_run: true` means the verdict was evaluated but not enforced, set by
+  either the matching rule's `dryRun` or the global `defaults.dryRun`.
+- Log level is `WARN` for any `deny` decision, including one suppressed by
+  `dry_run`, and `INFO` otherwise.
+- `rule == "<defaults>"` means no group produced a verdict and the
+  `defaults.action` fired.
 
 ## Response headers emitted to Envoy
 
