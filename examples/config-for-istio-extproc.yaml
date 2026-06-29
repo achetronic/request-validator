@@ -1,0 +1,82 @@
+# Istio wiring for the request-validator extProc engine (gRPC, :9090).
+#
+# The extAuthz engine (HTTP) is wired separately, see
+# config-for-istio-extauthz.yaml.
+#
+# Istio has no MeshConfig extensionProvider for ext_proc, so the whole
+# wiring is a single EnvoyFilter that inserts the ext_proc HTTP filter on
+# the protected workload's inbound sidecar. The response the workload
+# produces (e.g. Keycloak's 302 during DCR) flows back out through this
+# same HTTP connection manager, so the responseHeaders / responseBody
+# phases fire here and the validator can rewrite it (the interstitial
+# recipe in policy.yaml).
+#
+# Replace the placeholders before applying:
+#   <NAMESPACE>      namespace where request-validator runs.
+#   <WORKLOAD_NS>    namespace where the workload being protected runs
+#                    (e.g. the Keycloak namespace).
+#   <WORKLOAD_NAME>  app.kubernetes.io/name (or equivalent) label of
+#                    the workload whose sidecar gets the filter.
+#
+# Prerequisite on the validator Service: the gRPC port (9090) MUST be
+# named with a `grpc-` or `http2-` prefix (e.g. `grpc-extproc`). Istio
+# only negotiates HTTP/2 on the generated cluster when the port name says
+# so, and gRPC needs HTTP/2. A plain `tcp`/`http` name leaves the cluster
+# on HTTP/1 and the ext_proc stream never connects.
+
+
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: request-validator-ext-proc
+  namespace: <WORKLOAD_NS>
+spec:
+  workloadSelector:
+    labels:
+      app.kubernetes.io/name: <WORKLOAD_NAME>
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                # Insert ext_proc right before the router so it runs after
+                # ext_authz has already gated the request and still sees
+                # the full response on the way out.
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            # Point at the cluster Istio already generates for the
+            # validator Service. No hand-written cluster needed.
+            grpc_service:
+              envoy_grpc:
+                cluster_name: outbound|9090||request-validator.<NAMESPACE>.svc.cluster.local
+              timeout: 2s
+            # How long Envoy waits for the validator to answer a single
+            # ProcessingRequest before giving up on it.
+            message_timeout: 2s
+            # Fail closed, mirroring failOpen: false on the ext-authz
+            # provider: if the validator is unreachable the response is not
+            # served. Set true to fail open, which lets untrusted redirects
+            # through unwarned when the validator is down.
+            failure_mode_allow: false
+            # Match the phases the policy actually uses. This default fits
+            # the interstitial recipe: skip the request, inspect response
+            # headers, touch no bodies. Widen as the policy grows:
+            #   - extProc requestHeaders groups need request_header_mode: SEND.
+            #   - *Body phases (setBody, or directResponse reading
+            #     response.body) need the matching body mode set to BUFFERED,
+            #     with the buffer kept in step with
+            #     defaults.extProc.maxBodyBytes in the policy.
+            processing_mode:
+              request_header_mode: SKIP
+              response_header_mode: SEND
+              request_body_mode: NONE
+              response_body_mode: NONE

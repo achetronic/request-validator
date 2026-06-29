@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Untrusted Redirect Warning</title>
+</head>
+<body>
+    <h1>Warning: Untrusted Redirect</h1>
+    <p>The application is trying to redirect you to an untrusted external destination.</p>
+    <p>If you wish to proceed, click the link below:</p>
+    <a id="go" href="#">Go to external place</a>
+    <script>
+        // target arrives base64-encoded to avoid breaking the page or allowing injection
+        document.getElementById('go').href = atob('__TARGET_B64__');
+    </script>
+</body>
+</html>

@@ -1,4 +1,7 @@
-# Istio wiring for request-validator.
+# Istio wiring for the request-validator extAuthz engine (HTTP, :8080).
+#
+# The extProc engine (gRPC) is wired separately, see
+# config-for-istio-extproc.yaml.
 #
 # Three pieces fit together below:
 #

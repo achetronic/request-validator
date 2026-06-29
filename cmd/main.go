@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"request-validator/internal/configwatch"
+	"request-validator/internal/grpcserver"
 	"request-validator/internal/httpserver"
 	"request-validator/internal/log"
 	"request-validator/internal/policy"
@@ -26,6 +27,7 @@ var version = "dev"
 func main() {
 	var (
 		port            = flag.Int("port", 8080, "HTTP server port")
+		grpcPort        = flag.Int("grpc-port", 9090, "gRPC ext_proc server port")
 		configPath      = flag.String("config", "policy.yaml", "Path to the policy file")
 		level           = flag.String("log-level", "", "Override logging.level from the policy file (debug|info|warn|error)")
 		format          = flag.String("log-format", "", "Override logging.format from the policy file (json|console)")
@@ -54,6 +56,7 @@ func main() {
 	logLoaded("policy loaded", *configPath, cfg)
 
 	srv := httpserver.New(cfg)
+	gsrv := grpcserver.New(cfg)
 
 	// Single function used by every reload trigger (SIGHUP and fsnotify).
 	// The new config replaces the old one atomically; the old facts
@@ -73,6 +76,7 @@ func main() {
 		}
 		applyLogging(newCfg.Logging, *level, *format)
 		old := srv.SetPolicy(newCfg)
+		gsrv.SetPolicy(newCfg)
 		if old != nil {
 			old.Stop()
 		}
@@ -109,13 +113,15 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() { errCh <- srv.Run(fmt.Sprintf(":%d", *port)) }()
+	go func() { errCh <- gsrv.Run(fmt.Sprintf(":%d", *grpcPort)) }()
 
 	select {
 	case <-stop:
 		log.Infow("shutting down")
 		srv.Stop()
+		gsrv.Stop()
 		// Stop the shared-source goroutines belonging to the policy that
 		// was current at shutdown time.
 		if p := srv.Policy(); p != nil {
@@ -141,7 +147,7 @@ func logLoaded(msg, path string, cfg *policy.Config, extra ...any) {
 		"path", path,
 		"groups", len(cfg.Groups),
 		"rules", rules,
-		"default", cfg.Defaults.Action,
+		"default", cfg.Defaults.ExtAuthz.Action,
 	}
 	kv = append(kv, extra...)
 	log.Infow(msg, kv...)
