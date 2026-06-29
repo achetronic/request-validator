@@ -10,20 +10,20 @@ import (
 // request.query. These complement the convenience projections built into the
 // request object:
 //
-//   request.header     map<string,string>        first value per (lowercase) header name
-//   request.headers    map<string,list<string>>  every value per (lowercase) header name
-//   request.query      map<string,string>        first value per query parameter
-//   request.queries    map<string,list<string>>  every value per query parameter
+//	request.header     map<string,string>        first value per (lowercase) header name
+//	request.headers    map<string,list<string>>  every value per (lowercase) header name
+//	request.query      map<string,string>        first value per query parameter
+//	request.queries    map<string,list<string>>  every value per query parameter
 //
 // With those projections most lookups are just:
 //
-//   request.header['x-api-key'] != ''
-//   request.query['debug'] == '1'
+//	request.header['x-api-key'] != ''
+//	request.query['debug'] == '1'
 //
 // The following functions add small ergonomic touches:
 //
-//   has(name, bucket)        bool   true if name exists in the given bucket and has a non-empty value
-//   firstOr(bucket, name, d) string first value of name in bucket, or d if not present
+//	has(name, bucket)        bool   true if name exists in the given bucket and has a non-empty value
+//	firstOr(bucket, name, d) string first value of name in bucket, or d if not present
 //
 // They are generic enough to apply to either headers or query buckets.
 func httpShortcutsLibrary() cel.EnvOption {
