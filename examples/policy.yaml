@@ -1,5 +1,4 @@
-# Example policy for the Keycloak DCR (Dynamic Client Registration) endpoint
-# on auth.example-1.com / auth.example-2.com, restricted to the `mcp` realm.
+# on auth.example-1.com / auth.example-2.com, restricted to the mcp realm.
 # The corporate Keycloak hostname is always denied.
 #
 # Trust model summary:
@@ -21,23 +20,24 @@
 # Engine-wide settings. What happens when no group decides, how big a body
 # we are willing to read, and whether evaluation errors should fail open.
 defaults:
-  action: deny
-  denyStatus: 403
-  denyBody: "Forbidden"
-  maxBodyBytes: 1MiB
-  allowOnError: false
+  extAuthz:
+    action: deny
+    denyStatus: 403
+    denyBody: "Forbidden"
+    maxBodyBytes: 1MiB
+    allowOnError: false
   dryRun: false             # global shadow mode: evaluate, never enforce
 
 
 # Logging produces one structured access-log record per request, plus
 # anything the engine wants to say (boot, reload, fact fetch failures,
 # etc.). The CLI flags --log-level and --log-format, when set, override
-# the values in this section.
+# the file values in this section.
 #
-# Headers in `excludeHeaders` never appear in the log. Headers in
-# `redactHeaders` appear but with their value masked: the first
-# `redactReveal` characters are shown, the rest is replaced with '*'.
-# Values shorter than `2 * redactReveal` are fully masked, so short
+# Headers in excludeHeaders never appear in the log. Headers in
+# redactHeaders appear but with their value masked: the first
+# redactReveal characters are shown, the rest is replaced with '*'.
+# Values shorter than 2 * redactReveal are fully masked, so short
 # tokens don't leak by accident.
 logging:
   level: info               # debug | info | warn | error
@@ -58,7 +58,7 @@ logging:
     - code
 
 
-# Named external values referenced as `facts.<name>` from CEL.
+# Named external values referenced as facts.<name> from CEL.
 #
 # Three ways to load each one:
 #   value   inline literal (any YAML shape).
@@ -109,16 +109,25 @@ facts:
       interval: 10m
       timeout: 15s
 
+  # Domains trusted for DCR redirects.
+  - name: trustedRedirectDomains
+    method: value
+    value:
+      - example-1.com
+      - example-2.com
+      - google.com
 
-# Ordered list of rule buckets. The first group whose `match` is true and
+  # Interstitial HTML warning page content.
+  - name: interstitialHtml
+    method: file
+    file:
+      path: examples/interstitial.html
+
+
+
+# Ordered list of rule buckets. The first group whose match is true and
 # whose internal rules produce a verdict wins; otherwise defaults.action
 # applies.
-#
-# Per-group `mode`:
-#   firstMatch (default): the first rule whose `match` is true decides.
-#   all:                  every rule must match, otherwise the group denies.
-#
-# A rule inherits its `action` from the group unless it declares its own.
 groups:
 
   # NOTE on Keycloak DCR paths.
@@ -127,20 +136,26 @@ groups:
   # The regex `^/realms/[^/]+/clients-registrations(/.*)?$` covers both the
   # bare collection path and the `/openid-connect[/...]` sub-paths. The
   # paired Istio AuthorizationPolicy needs glob patterns that span slashes
-  # too - see examples/config-for-istio.yaml for the `{*}` / `{**}` syntax.
+  # too - see examples/config-for-istio-extauthz.yaml for the `{*}`, `{**}` syntax.
 
   # Corporate Keycloak: DCR is never allowed here.
   - name: dcr-corporate-deny
-    action: deny
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     rules:
       - name: block-corporate
         match: |
           request.host == 'keycloak.internal.example-1.com' &&
           request.path.matches('^/realms/[^/]+/clients-registrations(/.*)?$')
+        validation:
+          action: deny
 
   # Anything coming from the internal network on the mcp realm gets in.
   - name: dcr-internal
-    action: allow
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     match: |
       request.method == 'POST' &&
       request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
@@ -148,10 +163,14 @@ groups:
     rules:
       - name: from-internal-cidr
         match: inCIDR(request.remoteIp, facts.internalCidrs)
+        validation:
+          action: allow
 
   # Claude calls in from a small, stable set of CIDRs.
   - name: dcr-claude
-    action: allow
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     match: |
       request.method == 'POST' &&
       request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
@@ -159,12 +178,16 @@ groups:
     rules:
       - name: from-claude-cidr
         match: inCIDR(request.remoteIp, facts.claudeCidrs)
+        validation:
+          action: allow
 
   # ChatGPT calls in from the CIDRs OpenAI publishes. The scope is guarded
   # so the rule simply doesn't fire if the feed hasn't been populated yet
   # (tests, or the few seconds before the first successful fetch on boot).
   - name: dcr-chatgpt
-    action: allow
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     match: |
       request.method == 'POST' &&
       request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
@@ -175,10 +198,14 @@ groups:
         match: |
           inCIDR(request.remoteIp,
             parseJSON(facts.chatgptFeed).prefixes.map(p, p.ipv4Prefix))
+        validation:
+          action: allow
 
   # Mistral, in dry-run for now. Same shape as the ChatGPT rule.
   - name: dcr-mistral
-    action: allow
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     match: |
       request.method == 'POST' &&
       request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
@@ -190,6 +217,8 @@ groups:
         match: |
           inCIDR(request.remoteIp,
             parseJSON(facts.mistralFeed).prefixes.map(p, p.ipv4Prefix))
+        validation:
+          action: allow
 
   # Antigravity runs on the end user's machine, so the source IP is
   # whatever residential ISP they're on. We have to recognise the client
@@ -203,7 +232,9 @@ groups:
   # Both are fixed properties of the Antigravity client, so they live in
   # the rule itself rather than as facts.
   - name: dcr-antigravity
-    action: allow
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     match: |
       request.method == 'POST' &&
       request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
@@ -213,8 +244,9 @@ groups:
     rules:
       # Sanity cap: more than 5 redirect URIs is fishy regardless of shape.
       - name: too-many-redirects
-        action: deny
         match: "size(request.body.json.redirect_uris) > 5"
+        validation:
+          action: deny
 
       # The canonical Google-hosted callback, used when OAuth is set up
       # manually instead of through DCR. Exactly one URI, fixed value.
@@ -222,6 +254,8 @@ groups:
         match: |
           size(request.body.json.redirect_uris) == 1 &&
           request.body.json.redirect_uris[0] == 'https://antigravity.google/oauth-callback'
+        validation:
+          action: allow
 
       # DCR-issued loopback clients. Every redirect_uri must be HTTPS,
       # loopback, with a non-empty port. We also sanity-check the
@@ -238,13 +272,58 @@ groups:
               request.body.json.response_types == ['code']) &&
           (!has(request.body.json.token_endpoint_auth_method) ||
               request.body.json.token_endpoint_auth_method == 'none')
+        validation:
+          action: allow
 
   # The master realm is for administrators only. Nobody should reach it
   # through the public hostname.
   - name: block-master-realm-public
-    action: deny
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     rules:
       - name: block
         match: |
           request.host in ['auth.example-2.com', 'auth.example-1.com'] &&
           request.path.startsWith('/realms/master')
+        validation:
+          action: deny
+
+  # Intercept Keycloak redirects during DCR. If the target is untrusted,
+  # serve our warning interstitial page directly.
+  - name: dcr-redirect-rewriter
+    parameters:
+      engine: extProc
+      phase: responseHeaders
+      mode: firstMatch
+    match: |
+      response.status == 302 &&
+      has('location', response.headers)
+    rules:
+      - name: redirect-to-interstitial
+        match: |
+          !facts.trustedRedirectDomains.exists(d,
+            parseURL(response.header['location']).host == d ||
+            parseURL(response.header['location']).host.endsWith('.' + d)
+          )
+        mutations:
+          - op: directResponse
+            status: 200
+            headers: '{"content-type": "text/html"}'
+            body: "facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(response.header['location']))"
+
+  # Strip sensitive internal headers from all upstream responses.
+  - name: downstream-header-stripper
+    parameters:
+      engine: extProc
+      phase: responseHeaders
+      mode: applyAll
+    rules:
+      - name: strip-internal-headers
+        match: "true"
+        mutations:
+          - op: removeHeader
+            name: Server
+          - op: removeHeader
+            name: X-Powered-By
+

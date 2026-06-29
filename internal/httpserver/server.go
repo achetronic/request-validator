@@ -114,7 +114,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, p.Defaults.MaxBodyBytes.Int64()))
+	limit := p.Defaults.ExtAuthz.MaxBodyBytes.Int64()
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		// Reading the body failed: the policy cannot be evaluated, so the
 		// default is fail-closed. Under global dry-run the request still passes
@@ -128,8 +129,54 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set(hdrDry, "false")
-		w.WriteHeader(p.Defaults.DenyStatus)
-		_, _ = w.Write([]byte(p.Defaults.DenyBody))
+		w.WriteHeader(p.Defaults.ExtAuthz.DenyStatus)
+		_, _ = w.Write([]byte(p.Defaults.ExtAuthz.DenyBody))
+		return
+	}
+
+	if int64(len(body)) > limit {
+		// Overflow: request body exceeded the maximum configured limit.
+		truncatedBody := body[:limit]
+		req := &policy.Request{
+			Method:   r.Method,
+			Scheme:   firstNonEmpty(r.Header.Get("X-Forwarded-Proto"), r.URL.Scheme, "http"),
+			Host:     hostOnly(r.Host),
+			Path:     r.URL.Path,
+			RawQuery: r.URL.RawQuery,
+			RemoteIP: clientIP(r),
+			Headers:  r.Header,
+			Body:     truncatedBody,
+		}
+
+		dry := p.Defaults.DryRun
+		w.Header().Set(hdrRule, "<overflow>")
+		w.Header().Set(hdrReason, "request body too large")
+		w.Header().Set(hdrResult, "deny")
+		if dry {
+			w.Header().Set(hdrDry, "true")
+		} else {
+			w.Header().Set(hdrDry, "false")
+		}
+
+		s.metrics.record("<overflow>", "deny", dry)
+
+		if dry {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(p.Defaults.ExtAuthz.DenyStatus)
+			_, _ = w.Write([]byte(p.Defaults.ExtAuthz.DenyBody))
+		}
+
+		logger := log.Logger()
+		rec := []any{
+			"decision", "deny",
+			"rule", "<overflow>",
+			"reason", "request body too large",
+			"dry_run", dry,
+			"duration_ms", float64(time.Since(start).Microseconds()) / 1000.0,
+			accessLogAttrs(req, p.Logging),
+		}
+		logger.Warn("request decided", rec...)
 		return
 	}
 
@@ -172,8 +219,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	} else {
 		// Real deny, not shadowed: Envoy returns the configured error.
-		w.WriteHeader(p.Defaults.DenyStatus)
-		_, _ = w.Write([]byte(p.Defaults.DenyBody))
+		w.WriteHeader(p.Defaults.ExtAuthz.DenyStatus)
+		_, _ = w.Write([]byte(p.Defaults.ExtAuthz.DenyBody))
 	}
 
 	// One access-log record per request. Log level mirrors the verdict:

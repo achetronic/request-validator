@@ -11,43 +11,62 @@ as a sample; in production it ships as a Kubernetes ConfigMap mounted
 into the pod.
 
 **Engine**
-The in-memory runtime that turns a policy + a request into a verdict.
-Lives in `internal/policy/policy.go`.
+Which Envoy filter a group programs, set in `parameters.engine`:
+`extAuthz` (HTTP ext-authz, produces allow/deny) or `extProc` (gRPC
+ext_proc, mutates traffic or serves a direct response). The in-memory
+runtime lives in `internal/policy` (`Evaluate` for extAuthz, `EvaluateProc`
+for extProc).
 
 **Group**
-A named bucket of rules in the policy. Has a `mode` and an optional
-`match` (its scope). Groups are evaluated in declared order.
+A named bucket of rules in the policy. Carries `parameters` (engine, mode,
+and for extProc a phase) and an optional `match` (its scope). Groups are
+evaluated in declared order.
 
 **Rule**
-A single CEL boolean expression with an `action`. The leaf of a
-decision.
+The leaf of a decision. Always has a mandatory `match` (CEL boolean) plus
+either a `validation` (extAuthz verdict) or a list of `mutations`
+(extProc).
 
 **Mode**
+How a group composes its rules. Engine-specific:
 
-- `firstMatch` - the first rule whose `match` is true decides.
-- `all` - every rule must hold; one failure produces the opposite
-  verdict.
+- extAuthz: `firstMatch` (first rule whose `match` is true decides) or
+  `matchAll` (every rule must match, else deny).
+- extProc: `firstMatch` (first matching rule applies its mutations and
+  stops) or `applyAll` (every matching rule applies its mutations, in
+  order, last write wins per header).
 
 **Action**
-The verdict a rule (or group) produces when it matches: `allow` or
-`deny`. A rule inherits the group's action when it doesn't declare one.
+The verdict an extAuthz rule produces, in `validation.action`: `allow` or
+`deny`. Each rule states its own; there is no inheritance.
 
 **Match**
-The CEL boolean expression at the group or rule level. The group's
-`match` is the scope; the rule's `match` is the decision condition.
+The CEL boolean expression at the group or rule level. The group's `match`
+is the scope; the rule's `match` is the condition. The rule `match` is
+mandatory.
 
-**Fallthrough**
-What to do in a `firstMatch` group when a rule's `match` is false:
-`next` (try the next rule, the default), `allow` or `deny`
-(short-circuit).
+**Phase** (extProc only)
+Which ext_proc hook a group runs on: `requestHeaders`, `requestBody`,
+`responseHeaders`, `responseBody`. Determines the live CEL variables
+(`response` is only available in response phases).
+
+**Mutation**
+An extProc traffic change in a rule's `mutations` list. Incremental ops:
+`setHeader`, `appendHeader`, `removeHeader`, `setBody`, `setStatus`.
+
+**directResponse**
+The extProc op that discards the upstream response and serves one the
+rule builds (`status`, `headers` as a CEL map, `body` as a CEL string),
+mapping to Envoy's ImmediateResponse. Exclusive in its rule.
 
 **DryRun**
-A rule with `dryRun: true` is evaluated and logged but never actually
-denies. Used for shadow-testing future tightenings.
+A rule with `dryRun: true`, or the global `defaults.dryRun`, is evaluated
+and logged but never enforced: extAuthz passes 200, extProc responds
+CONTINUE without mutations.
 
 **Default action**
-What happens when no group decides. Configured under
-`defaults.action`; defaults to `deny` (fail-closed).
+The extAuthz verdict when no group decides. Configured under
+`defaults.extAuthz.action`; defaults to `deny` (fail-closed).
 
 ## Facts subsystem
 
@@ -99,13 +118,23 @@ shapes; whichever succeeds populates the corresponding fields.
 
 **ext-authz**
 Envoy's "External Authorization" filter. We implement the HTTP variant
-(`envoyExtAuthzHttp`). Envoy POSTs the original request to us, we
-return 200 or a non-2xx with the configured body.
+(`envoyExtAuthzHttp`). Envoy POSTs the original request to us, we return
+200 or a non-2xx with the configured body. Served by `internal/httpserver`.
+
+**ext_proc**
+Envoy's "External Processing" filter (gRPC). Envoy streams the request and
+response phases to us; we reply with mutations, a direct response, or
+CONTINUE. Served by `internal/grpcserver`.
 
 **Decision**
-The Go struct (`policy.Decision`) carrying the verdict, the winning
-rule name, a short `reason`, and the `dry_run` flag. Becomes the
-response status + headers.
+The Go struct (`policy.Decision`) carrying the extAuthz verdict, the
+winning rule name, a short `reason`, and the `dry_run` flag. Becomes the
+HTTP response status + headers.
+
+**ResolvedMutation**
+The Go struct (`policy.ResolvedMutation`) an extProc evaluation produces:
+an op with its CEL values already evaluated, ready for the gRPC server to
+translate into Envoy protos.
 
 ## Lifecycle
 
@@ -160,8 +189,9 @@ Common Expression Language. A spec-defined, sandbox-safe boolean
 expression language. https://github.com/google/cel-spec.
 
 **Activation**
-The set of variables CEL sees when evaluating a program. In our case
-always two top-level vars: `request` and `facts`.
+The set of variables CEL sees when evaluating a program. `request` and
+`facts` in request phases; `request`, `response` and `facts` in response
+phases.
 
 **Program**
 A compiled CEL expression ready to be evaluated. Cached by source

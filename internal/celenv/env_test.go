@@ -2,28 +2,12 @@ package celenv
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
-func evalBool(t *testing.T, env *Env, src string, req map[string]any) bool {
-	t.Helper()
-	prog, err := env.Compile(src)
-	if err != nil {
-		t.Fatalf("compile %q: %v", src, err)
-	}
-	out, err := Eval(context.Background(), prog, req, nil)
-	if err != nil {
-		t.Fatalf("eval %q: %v", src, err)
-	}
-	return out
-}
-
-func TestEnvSmoke(t *testing.T) {
-	env, err := New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := map[string]any{
+func sampleRequest() map[string]any {
+	return map[string]any{
 		"method":   "POST",
 		"host":     "auth.example-1.com",
 		"path":     "/realms/mcp/clients-registrations",
@@ -50,7 +34,56 @@ func TestEnvSmoke(t *testing.T) {
 			"contentType": "application/json",
 		},
 	}
+}
 
+func sampleResponse() map[string]any {
+	return map[string]any{
+		"status": int64(302),
+		"headers": map[string][]string{
+			"location": {"https://attacker.example/cb"},
+		},
+		"header": map[string]string{
+			"location": "https://attacker.example/cb",
+		},
+		"body": map[string]any{
+			"raw":         "",
+			"json":        map[string]any{},
+			"jsonOk":      false,
+			"yaml":        map[string]any{},
+			"yamlOk":      false,
+			"size":        int64(0),
+			"contentType": "text/html",
+		},
+	}
+}
+
+func requestVars() map[string]any {
+	return map[string]any{"request": sampleRequest(), "facts": map[string]any{}}
+}
+
+func responseVars() map[string]any {
+	return map[string]any{"request": sampleRequest(), "response": sampleResponse(), "facts": map[string]any{}}
+}
+
+func evalBool(t *testing.T, env *Env, src string, scope Scope, vars map[string]any) bool {
+	t.Helper()
+	prog, err := env.Compile(src, scope)
+	if err != nil {
+		t.Fatalf("compile %q: %v", src, err)
+	}
+	out, err := Eval(context.Background(), prog, vars)
+	if err != nil {
+		t.Fatalf("eval %q: %v", src, err)
+	}
+	return out
+}
+
+func TestEnvSmoke_RequestScopeBooleans(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vars := requestVars()
 	cases := []struct {
 		expr string
 		want bool
@@ -79,8 +112,259 @@ func TestEnvSmoke(t *testing.T) {
 		{`now() > timestamp("2000-01-01T00:00:00Z")`, true},
 	}
 	for _, c := range cases {
-		if got := evalBool(t, env, c.expr, req); got != c.want {
+		if got := evalBool(t, env, c.expr, ScopeRequest, vars); got != c.want {
 			t.Errorf("%q => %v, want %v", c.expr, got, c.want)
 		}
+	}
+}
+
+// Canary: response must NOT be reachable in the request scope. If someone
+// declares response globally instead of per-scope, this compile stops failing.
+func TestCompile_RejectsResponseVarInRequestScope(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.Compile(`response.status == 302`, ScopeRequest); err == nil {
+		t.Fatal("expected compile error referencing response in request scope, got nil")
+	} else if !strings.Contains(err.Error(), "response") {
+		t.Fatalf("error should mention the undeclared response variable, got: %v", err)
+	}
+}
+
+func TestCompile_AllowsResponseVarInResponseScope(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := evalBool(t, env, `response.status == 302`, ScopeResponse, responseVars()); !got {
+		t.Fatal("response.status == 302 should be true with the sample response")
+	}
+}
+
+// Canary: the cache must not let a source compiled in one scope leak into the
+// other. response.status is illegal in request scope and legal in response
+// scope; both behaviours must hold regardless of compilation order.
+func TestCompile_CacheIsScopeAware(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const src = `response.status == 302`
+	if _, err := env.Compile(src, ScopeRequest); err == nil {
+		t.Fatal("request scope must reject response.status")
+	}
+	if _, err := env.Compile(src, ScopeResponse); err != nil {
+		t.Fatalf("response scope must accept response.status, got: %v", err)
+	}
+	if _, err := env.Compile(src, ScopeRequest); err == nil {
+		t.Fatal("request scope must still reject response.status after caching in response scope")
+	}
+}
+
+func TestCompileString_AcceptsStringRejectsBool(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := env.CompileString(`"https://gw/warn?t=" + request.host`, ScopeRequest)
+	if err != nil {
+		t.Fatalf("compile string expr: %v", err)
+	}
+	got, err := EvalString(context.Background(), prog, requestVars())
+	if err != nil {
+		t.Fatalf("eval string: %v", err)
+	}
+	if got != "https://gw/warn?t=auth.example-1.com" {
+		t.Fatalf("unexpected string result: %q", got)
+	}
+	if _, err := env.CompileString(`request.method == "POST"`, ScopeRequest); err == nil {
+		t.Fatal("CompileString must reject a bool expression")
+	}
+}
+
+func TestCompileInt_AcceptsIntFromStatus(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := env.CompileInt(`response.status`, ScopeResponse)
+	if err != nil {
+		t.Fatalf("compile int expr: %v", err)
+	}
+	got, err := EvalInt(context.Background(), prog, responseVars())
+	if err != nil {
+		t.Fatalf("eval int: %v", err)
+	}
+	if got != 302 {
+		t.Fatalf("want 302, got %d", got)
+	}
+}
+
+// A dyn-typed expression that resolves to a non-string at runtime must surface
+// an error from EvalString rather than a wrong value.
+func TestEvalString_ErrorsOnNonStringRuntimeValue(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := env.CompileString(`request.body.json.redirect_uris`, ScopeRequest)
+	if err != nil {
+		t.Fatalf("compile dyn expr: %v", err)
+	}
+	if _, err := EvalString(context.Background(), prog, requestVars()); err == nil {
+		t.Fatal("EvalString must error when the runtime value is not a string")
+	}
+}
+
+func TestCompileStringMap_Literal(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expr := `{"content-type": "text/html", "cache-control": "no-store"}`
+	prog, err := env.CompileStringMap(expr, ScopeRequest)
+	if err != nil {
+		t.Fatalf("CompileStringMap failed: %v", err)
+	}
+
+	got, err := EvalStringMap(context.Background(), prog, requestVars())
+	if err != nil {
+		t.Fatalf("EvalStringMap failed: %v", err)
+	}
+
+	want := map[string]string{
+		"content-type":  "text/html",
+		"cache-control": "no-store",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("expected map of size %d, got %d: %+v", len(want), len(got), got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("key %q: got %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestCompileStringMap_ResponseHeader(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expr := `response.header`
+	prog, err := env.CompileStringMap(expr, ScopeResponse)
+	if err != nil {
+		t.Fatalf("CompileStringMap for response.header failed: %v", err)
+	}
+
+	got, err := EvalStringMap(context.Background(), prog, responseVars())
+	if err != nil {
+		t.Fatalf("EvalStringMap failed: %v", err)
+	}
+
+	want := "https://attacker.example/cb"
+	if got["location"] != want {
+		t.Errorf("expected location header to be %q, got %q (entire map: %+v)", want, got["location"], got)
+	}
+}
+
+func TestCompileStringMap_RejectAtCompileTime(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	invalidExprs := []string{
+		`"hello"`,
+		`200`,
+	}
+
+	for _, expr := range invalidExprs {
+		_, err := env.CompileStringMap(expr, ScopeResponse)
+		if err == nil {
+			t.Errorf("CompileStringMap should have failed at compile-time for %q", expr)
+		} else if !strings.Contains(err.Error(), "must return map(string, string)") {
+			t.Errorf("unexpected error message for %q: %v", expr, err)
+		}
+	}
+}
+
+func TestEvalStringMap_Canary_RuntimeTypeError(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Testing expressions that are dyn at compile-time, but evaluate to a non-string-map at runtime
+	invalidExprs := []struct {
+		expr  string
+		scope Scope
+		vars  map[string]any
+	}{
+		{`request.body.json`, ScopeRequest, requestVars()},
+		{`response.headers`, ScopeResponse, responseVars()},
+	}
+
+	for _, tc := range invalidExprs {
+		prog, err := env.CompileStringMap(tc.expr, tc.scope)
+		if err != nil {
+			t.Fatalf("CompileStringMap for %q failed: %v", tc.expr, err)
+		}
+
+		_, err = EvalStringMap(context.Background(), prog, tc.vars)
+		if err == nil {
+			t.Fatalf("EvalStringMap should have failed for %q", tc.expr)
+		}
+
+		// Check if we get the clear requested error format
+		expectedSubstr := "directResponse headers must be map<string,string>"
+		if !strings.Contains(err.Error(), expectedSubstr) {
+			t.Errorf("expected error to contain %q, got: %v", expectedSubstr, err)
+		}
+	}
+}
+
+func TestEvalStringMap_Canary_RuntimeNonMapError(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compile a dyn expression that resolves to a string
+	expr := `request.method`
+	prog, err := env.CompileStringMap(expr, ScopeRequest)
+	if err != nil {
+		t.Fatalf("CompileStringMap for %q failed: %v", expr, err)
+	}
+
+	_, err = EvalStringMap(context.Background(), prog, requestVars())
+	if err == nil {
+		t.Fatal("EvalStringMap should have failed for a non-map runtime value")
+	}
+
+	expectedSubstr := "expression did not evaluate to a map"
+	if !strings.Contains(err.Error(), expectedSubstr) {
+		t.Errorf("expected error to contain %q, got: %v", expectedSubstr, err)
+	}
+}
+
+func TestCompileStringMap_MapMergeNotSupported(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to use '+' operator to merge maps. Let's see if this compiles in CEL.
+	// CEL does not natively support map merge with '+', so this should fail to compile.
+	expr := `{"content-type": "text/html"} + {"cache-control": "no-store"}`
+	_, err = env.CompileStringMap(expr, ScopeRequest)
+	if err == nil {
+		t.Fatal("expected compilation to fail for map '+' operator, or does this version of cel-go actually support it?")
+	} else {
+		t.Logf("CompileStringMap for map '+' operator failed as expected: %v", err)
 	}
 }

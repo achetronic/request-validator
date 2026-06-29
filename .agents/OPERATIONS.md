@@ -45,7 +45,7 @@ controllers:
               spec: { httpGet: { path: /readyz, port: 8080 } },
             }
 service:
-  main: { controller: main, ports: { http: { port: 8080 } } }
+  main: { controller: main, ports: { http: { port: 8080 }, grpc: { port: 9090 } } }
 persistence:
   policy:
     type: configMap
@@ -57,10 +57,18 @@ Two pods minimum. Roll one at a time; both the readiness probe and the
 fail-closed boot semantics protect you from going live with a broken
 policy.
 
+The extAuthz engine listens on `:8080` (HTTP), the extProc engine on
+`:9090` (gRPC, flag `--grpc-port`). Expose both ports on the Service if
+you use both engines; the readiness/liveness probes stay on the HTTP
+port.
+
 ## Wiring into Istio
 
-`request-validator` is an Envoy ext-authz HTTP service. Two pieces of
-Istio config are needed:
+`request-validator` exposes two Envoy filters. Wire the one(s) you use.
+
+### extAuthz (HTTP)
+
+Two pieces of Istio config are needed:
 
 1. **`extensionProvider`** in `MeshConfig` (one-off, mesh-wide):
 
@@ -117,6 +125,16 @@ Istio config are needed:
 
    Only matched traffic hits the validator. The rest stays on your
    existing Istio policies.
+
+### extProc (gRPC)
+
+The extProc engine is reached through an `envoyExtProc` extension
+provider pointing at the gRPC port (`:9090`), selected on the target
+traffic. The exact resource depends on your Istio version; point it at
+the `grpc` Service port and consult the Istio docs for the current
+ext_proc provider schema. A group only runs when its `parameters.phase`
+matches the ext_proc message Envoy sends, so enable the body phases in
+the filter config only if a policy needs the body.
 
 ## Observability
 
@@ -248,7 +266,7 @@ The previous policy stays active and the failure is logged at `ERROR`.
 - Memory: a few tens of MB resting; peaks during reload while the
   previous and new `Config` coexist. 128 MiB requests are comfortable
   for the example policy.
-- CPU: dominated by CEL evaluation. Around 0.1–0.5 ms p99 per request
+- CPU: dominated by CEL evaluation. Around 0.1-0.5 ms p99 per request
   for the example. Scale horizontally.
 - File descriptors: one per URL fact fetcher keepalive + the HTTP
   listener. Default limits are fine.

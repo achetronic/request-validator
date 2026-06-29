@@ -52,11 +52,12 @@ becomes invisible.
 
 | Package       | What's covered                                                                                                                  |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `celenv`      | Smoke test of every custom function (inCIDR, glob, parseJSON, parseURL, sha256Hex, jsonPath, now, has, firstOr, isPrivateIP...) |
+| `celenv`      | Smoke test of every custom function (inCIDR, glob, parseJSON, parseURL, sha256Hex, jsonPath, now, has, firstOr, isPrivateIP...), per-scope compilation (response var rejected in request scope), typed compile/eval (bool/string/int/stringmap) |
 | `configwatch` | In-place write, save-via-rename, kubelet `..data` swap, debounce of bursts                                                      |
 | `facts`       | inline values, file source, URL fetch + refresh, URL fetch failure keeps previous value, validation (dupes, missing fields)     |
-| `httpserver`  | Allow/deny end-to-end, DCR body validation, hot-reload swap, access log (exclude/redact headers, query redact, console + json)  |
-| `policy`      | Evaluator (firstMatch / all / dryRun / fallthrough / action inheritance), example/policy.yaml flow, URL fact integration        |
+| `httpserver`  | extAuthz allow/deny end-to-end, DCR body validation, body overflow deny, hot-reload swap, access log (exclude/redact headers, query redact, console + json) |
+| `policy`      | extAuthz evaluator (firstMatch / matchAll / dryRun, no fallthrough or inheritance), extProc EvaluateProc (firstMatch / applyAll, mutations, directResponse, fail-safe), engine isolation (each engine ignores the other's groups) and per-phase filtering, load-time validation errors, scope wiring, example/policy.yaml flow, URL fact integration |
+| `grpcserver`  | ext_proc stream mapping per phase, header/body/status mutations to Envoy protos, directResponse short-circuit (ImmediateResponse), dry-run suppression, body overflow skip/fail, pseudo-header parsing |
 
 ## How to add a test
 

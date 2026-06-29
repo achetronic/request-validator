@@ -15,7 +15,7 @@ type metrics struct {
 	totalDenied  atomic.Uint64
 	totalErrors  atomic.Uint64
 
-	mu     sync.RWMutex
+	mu      sync.RWMutex
 	perRule map[ruleKey]*ruleCounters
 }
 

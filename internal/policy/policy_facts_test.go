@@ -8,18 +8,18 @@ import (
 )
 
 // TestFactsURLIntegratedWithCEL boots a fake feed server, declares a
-// `facts` URL source pointing at it, and exercises a CEL expression that
-// parses the body and uses it inside inCIDR.
+// `facts` URL source pointing at it, and exercises a CEL expression.
 func TestFactsURLIntegratedWithCEL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "application/json")
-		// Match the real ChatGPT / GCP-style shape: {prefixes:[{ipv4Prefix:"..."}]}.
 		_, _ = w.Write([]byte(`{"creationTime":"now","prefixes":[{"ipv4Prefix":"10.0.0.0/8"},{"ipv4Prefix":"192.168.0.0/16"}]}`))
 	}))
 	defer srv.Close()
 
 	c, err := LoadBytes([]byte(`
-defaults: { action: deny }
+defaults:
+  extAuthz:
+    action: deny
 facts:
   - name: feed
     method: url
@@ -29,12 +29,16 @@ facts:
       timeout: 2s
 groups:
   - name: g
-    action: allow
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     rules:
       - name: ok
         match: |
           inCIDR(request.remoteIp,
             parseJSON(facts.feed).prefixes.map(p, p.ipv4Prefix))
+        validation:
+          action: allow
 `))
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -55,7 +59,9 @@ groups:
 // TestFactsInlineValue exercises the value method with a literal list.
 func TestFactsInlineValue(t *testing.T) {
 	c, err := LoadBytes([]byte(`
-defaults: { action: deny }
+defaults:
+  extAuthz:
+    action: deny
 facts:
   - name: cidrs
     method: value
@@ -64,10 +70,14 @@ facts:
       - 192.168.0.0/16
 groups:
   - name: g
-    action: allow
+    parameters:
+      engine: extAuthz
+      mode: firstMatch
     rules:
       - name: ok
         match: inCIDR(request.remoteIp, facts.cidrs)
+        validation:
+          action: allow
 `))
 	if err != nil {
 		t.Fatalf("load: %v", err)
