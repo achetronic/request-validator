@@ -6,13 +6,19 @@ you came to do.
 
 ## What this project is
 
-`request-validator` is a generic Envoy / Istio **ext-authz HTTP** service.
-Envoy forwards an incoming request to us, we say `allow` or `deny`, and
-Envoy enforces. The decision is driven by a **CEL-based** YAML policy.
+`request-validator` is a generic Envoy / Istio policy service with two
+engines driven by one **CEL-based** YAML policy:
+
+- **extAuthz** (HTTP ext-authz): Envoy forwards a request, we say `allow`
+  or `deny`, Envoy enforces.
+- **extProc** (gRPC ext_proc): we inspect and mutate live traffic
+  (request or response headers and body), or short-circuit and serve our
+  own response.
 
 It was built to cover the cases plain Istio `AuthorizationPolicy` cannot
 (inspecting request bodies, combining CIDRs with JSON contents, validating
-OAuth `redirect_uris`, etc.).
+OAuth `redirect_uris`, rewriting an untrusted DCR redirect into a warning
+page, etc.).
 
 ## When you arrive, read this first
 
@@ -29,7 +35,7 @@ Only after that, drill into:
 
 - **`.agents/DECISIONS.md`** - _why_ the project looks the way it does
   (CEL over a custom DSL, fail-closed semantics, in-process feed fetching,
-  HTTP ext-authz over gRPC for now, etc.).
+  the two-engine split, the mutation and directResponse model, etc.).
 - **`.agents/CODE_CONVENTIONS.md`** - house style for Go in this repo.
 - **`.agents/TESTING.md`** - how to run the test suite and the E2E recipe.
 - **`.agents/OPERATIONS.md`** - deploy notes, observability, troubleshooting.
@@ -44,7 +50,8 @@ Only after that, drill into:
 │   ├── celenv/                   CEL environment + custom functions
 │   ├── configwatch/              fsnotify wrapper for policy hot-reload
 │   ├── facts/                    facts registry (inline/file/url sources)
-│   ├── httpserver/               ext-authz HTTP endpoint + metrics
+│   ├── httpserver/               extAuthz HTTP endpoint + metrics
+│   ├── grpcserver/               extProc gRPC endpoint (Envoy ext_proc)
 │   ├── jsonpath/                 tiny JSONPath subset used by the engine
 │   ├── log/                      slog wrapper (json | console handlers)
 │   └── policy/                   policy types, parser, evaluator
@@ -56,17 +63,18 @@ Only after that, drill into:
 └── .agents/                      this directory
 ```
 
-## Common tasks → where to start
+## Common tasks: where to start
 
-| You want to...                                   | Read                                                         | Touch                                       |
-| ------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------- |
-| Add a new CEL function (e.g. `b64Url`)           | `ARCHITECTURE.md` → "CEL environment", `CODE_CONVENTIONS.md` | `internal/celenv/<family>.go`               |
-| Add a new source method for `facts:`             | `ARCHITECTURE.md` → "Facts lifecycle"                        | `internal/facts/facts.go`                   |
-| Tweak the access log shape or redaction rules    | `POLICY_DSL.md` → "logging", `ARCHITECTURE.md` → "Logging"   | `internal/httpserver/access.go` + `policy/` |
-| Add a new top-level YAML section                 | `POLICY_DSL.md`, `ARCHITECTURE.md` → "Config types"          | `internal/policy/policy.go`                 |
-| Speed up the request hot path                    | `ARCHITECTURE.md` → "Request lifecycle"                      | `internal/httpserver/server.go`             |
-| Change deploy/observability behaviour            | `OPERATIONS.md`                                              | Dockerfile, `.github/workflows/`, README    |
-| Understand a past decision (e.g. "why no gRPC?") | `DECISIONS.md`                                               | -                                           |
+| You want to...                                   | Read                                                          | Touch                                       |
+| ------------------------------------------------ | ------------------------------------------------------------- | ------------------------------------------- |
+| Add a new CEL function (e.g. `b64Url`)           | `ARCHITECTURE.md` ("CEL environment"), `CODE_CONVENTIONS.md`   | `internal/celenv/<family>.go`               |
+| Add a new source method for `facts:`             | `ARCHITECTURE.md` ("Facts lifecycle")                         | `internal/facts/facts.go`                   |
+| Tweak the access log shape or redaction rules    | `POLICY_DSL.md` ("logging"), `ARCHITECTURE.md` ("Logging")     | `internal/httpserver/access.go` + `policy/` |
+| Add a new top-level YAML section                 | `POLICY_DSL.md`, `ARCHITECTURE.md` ("Config types")           | `internal/policy/policy.go`                 |
+| Add or change an extProc mutation op             | `POLICY_DSL.md` ("Mutation ops"), `DECISIONS.md` (D-019/D-023) | `internal/policy/` + `internal/grpcserver/` |
+| Speed up the request hot path                    | `ARCHITECTURE.md` ("Request lifecycle")                       | `internal/httpserver/server.go`             |
+| Change deploy/observability behaviour            | `OPERATIONS.md`                                               | Dockerfile, `.github/workflows/`, README    |
+| Understand a past decision                       | `DECISIONS.md`                                                | -                                           |
 
 ## Hard rules - do not break
 

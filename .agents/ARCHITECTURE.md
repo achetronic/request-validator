@@ -12,21 +12,23 @@ internal/
   celenv/             CEL environment, custom functions, program cache
   jsonpath/           tiny JSONPath subset (used by `jsonPath` CEL fn)
   facts/              facts registry: inline values, file reads, URL fetchers
-  policy/             config types, YAML parser, evaluator
+  policy/             config types, YAML parser, evaluators (extAuthz + extProc)
   configwatch/        fsnotify wrapper, debounce, k8s ConfigMap-aware
-  httpserver/         /healthz, /readyz, /metrics, ext-authz endpoint
+  httpserver/         /healthz, /readyz, /metrics, extAuthz endpoint
+  grpcserver/         extProc endpoint (Envoy ext_proc gRPC stream)
 ```
 
 The dependency graph is acyclic and one-directional:
 
 ```
-cmd  ──►  policy ──►  facts
-              │        │
-              ├──►  celenv  ──►  jsonpath
-              │
-cmd  ──►  httpserver  ──►  policy
-cmd  ──►  configwatch
-cmd  ──►  log         (everyone else also imports log)
+cmd  -->  policy -->  facts
+              |        |
+              +-->  celenv  -->  jsonpath
+              |
+cmd  -->  httpserver  -->  policy
+cmd  -->  grpcserver  -->  policy
+cmd  -->  configwatch
+cmd  -->  log         (everyone else also imports log)
 ```
 
 `log` is the only package every other one depends on. It must stay
@@ -38,10 +40,10 @@ dependency-free of the rest.
 
 ```
 Config{
-  Defaults  Defaults                  // action, denyStatus, denyBody, maxBodyBytes, allowOnError
+  Defaults  Defaults                  // per-engine: Defaults.ExtAuthz + Defaults.ExtProc + global DryRun
   Logging   Logging                   // level, format, exclude/redact headers, etc.
   Facts     []facts.Spec              // declared facts
-  Groups    []Group                   // ordered list of rule buckets
+  Groups    []Group                   // ordered list of rule buckets, each bound to one engine
 
   // not in YAML, set during LoadBytes:
   env       *celenv.Env               // shared CEL env + program cache
@@ -49,9 +51,12 @@ Config{
 }
 ```
 
-A `Group` carries its compiled `matchProg cel.Program`, and each `Rule`
-carries its own. Compilation happens once in `LoadBytes()`; the request
-path only executes already-compiled programs.
+A `Group` carries `parameters` (engine, mode, phase) and its compiled
+`matchProg cel.Program`. Each `Rule` carries its own `matchProg`, plus
+either a `Validation` (extAuthz) or a list of `Mutation` whose CEL
+expressions are also compiled (value/code/headers/body). Compilation
+happens once in `LoadBytes()`; the request path only executes
+already-compiled programs.
 
 ## Request lifecycle
 
@@ -72,14 +77,14 @@ path only executes already-compiled programs.
               ┌────────────┴────────────┐
               │ for each Group, in order│
               └────────────┬────────────┘
-                           │ 6. group.matchProg → bool
+                           │ 6. group.matchProg to bool
                            │    (skip silently if false)
                            ▼
               ┌──────────────────────────┐
               │ Group.Mode == firstMatch │  every rule:
-              │   or == all              │    rule.matchProg → bool
-              └──────────────┬───────────┘    + action inheritance
-                             ▼                + dryRun + fallthrough
+              │   or == all              │    rule.matchProg to bool
+              └──────────────┬───────────┘    + validation.action
+                             ▼                + dryRun (no fallthrough)
                        ┌──────────┐
                        │ Decision │
                        │ {Allowed,│
@@ -96,12 +101,44 @@ path only executes already-compiled programs.
 There is exactly **one** access-log record per request, level `INFO` for
 allow / `WARN` for deny. The CEL programs were compiled at policy load,
 so the only per-request cost is body read + map build + a few CEL calls.
+Only groups whose `parameters.engine` is `extAuthz` are evaluated here;
+`firstMatch` lets the first matching rule decide, `matchAll` requires
+every rule to match or denies. There is no action inheritance and no
+fallthrough.
+
+## Response lifecycle (extProc, gRPC)
+
+`grpcserver` implements Envoy's `ext_proc` bidirectional stream. Each
+stream message maps to a phase (`requestHeaders`, `requestBody`,
+`responseHeaders`, `responseBody`); the server keeps per-stream state
+(the request, then the response) and calls `policy.EvaluateProc(phase,
+req, resp)`, which walks the extProc groups bound to that phase
+(`firstMatch` or `applyAll`) and returns the resolved mutations (CEL
+values already evaluated). The server then:
+
+- if a `directResponse` is applicable, emits an Envoy `ImmediateResponse`
+  (status + headers + body) and ignores the rest (short-circuit);
+- otherwise builds a `CommonResponse` with the header/body mutations;
+- under dry-run (global or per-rule), responds CONTINUE while logging what
+  it would have done;
+- on a body phase, enforces `extProc.maxBodyBytes` with
+  `onBodyOverflow: skip | fail`.
+
+Live CEL variables follow the phase: `request`/`facts` in request phases,
+plus `response` in response phases.
 
 ## CEL environment (`internal/celenv`)
 
-Built once per policy load, in `celenv.New()`:
+Built once per policy load, in `celenv.New()`, as two scoped environments:
 
-- Variables declared: `request` (dyn) and `facts` (dyn).
+- `ScopeRequest` declares `request` (dyn) and `facts` (dyn).
+- `ScopeResponse` declares `request`, `response` (dyn) and `facts`.
+  An expression that references `response` in a request scope fails to
+  compile, which is how the per-phase variable contract is enforced.
+- Compilation is typed: `Compile` (bool, for `match`), `CompileString`
+  (header/body values), `CompileInt` (`setStatus` code), `CompileStringMap`
+  (`directResponse.headers`, `map<string,string>`). Output type is checked
+  at load. Their `Eval*` counterparts re-check the type at runtime.
 - Standard library + these extensions enabled:
   `ext.Strings()`, `ext.Encoders()`, `ext.Lists()`, `ext.Sets()`,
   `ext.Math()`, `ext.Bindings()`.
@@ -136,17 +173,17 @@ policy.LoadFile
    │
    ▼
 policy.LoadBytes
-   ├─ yaml.Unmarshal → Config{Defaults, Logging, Facts, Groups}
+   ├─ yaml.Unmarshal to Config{Defaults, Logging, Facts, Groups}
    ├─ applyDefaults
    ├─ validate
-   ├─ celenv.New        ← every Compile() is cached
-   ├─ facts.New(Facts)  ← builds Registry, value entries already populated
-   └─ compile           ← turn match strings into cel.Program
+   ├─ celenv.New        (every Compile() is cached)
+   ├─ facts.New(Facts)  (builds Registry, value entries already populated)
+   └─ compile           (turn match/mutation strings into cel.Program)
 
 cfg.Start(ctx)
    └─ for each fact:
-         file → os.ReadFile  → store as string
-         url  → http GET     → store as string + spawn goroutine
+         file  os.ReadFile  store as string
+         url   http GET     store as string + spawn goroutine
                                 with time.Ticker(interval)
 ```
 
@@ -205,16 +242,23 @@ masked. The redaction policy: a value of length `< 2 * redactReveal` is
 fully masked; otherwise the first `redactReveal` characters are shown
 and the rest replaced with `*`.
 
-## HTTP server endpoints
+## Servers and endpoints
+
+The HTTP server (`httpserver`, default `:8080`) serves extAuthz plus
+operational endpoints:
 
 | Path       | Purpose                                                                 |
 | ---------- | ----------------------------------------------------------------------- |
-| `/`        | ext-authz check. Envoy POSTs the original request here.                 |
+| `/`        | extAuthz check. Envoy POSTs the original request here.                  |
 | `/healthz` | always 200 once the process is up.                                      |
 | `/readyz`  | 200 only after the first policy is installed (used as readiness probe). |
 | `/metrics` | Prometheus text format. Counters per (rule, outcome, dry_run).          |
 
 `/` accepts any method and path; it inspects whatever Envoy forwarded.
+
+The gRPC server (`grpcserver`, default `:9090`) serves the Envoy ext_proc
+`ExternalProcessor` service for the extProc engine. Both servers share the
+same `*policy.Config` pointer and the same hot-reload path in `cmd`.
 
 ## Build & ship
 

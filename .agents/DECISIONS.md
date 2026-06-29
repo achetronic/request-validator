@@ -283,3 +283,311 @@ suppression check belongs there.
 `request_validator_rule_decisions_total{outcome="deny",dry_run="true"}`. One
 decision metric per request, with `dry_run` reflecting whether enforcement
 was suppressed.
+
+
+## D-015 - Two engines: ext_authz (decide) and ext_proc (mutate)
+
+**Context.** The service was a pure ext-authz: read a request, return
+allow/deny. A new need appeared: intercept the response Keycloak emits
+during DCR with remote MCPs and, for untrusted redirect targets, rewrite
+the `Location` header so the user lands on an interstitial warning page
+instead of a risky destination. The same applies more broadly to
+inspecting and rewriting traffic, not just admitting it. Doing this with
+an Envoy Lua filter that embeds HTML in the data plane is a mess.
+
+**Decision.** Add a second engine, `extProc`, served over Envoy's
+`ext_proc` gRPC API, living next to the existing HTTP ext-authz. One
+binary, two listeners, one shared policy and hot-reload. This supersedes
+the "HTTP only, no gRPC" stance of D-008 by adding gRPC for a different
+filter, not by replacing the HTTP ext-authz.
+
+**Reasoning.**
+
+- ext_authz is a binary gatekeeper (pass/deny). ext_proc is the only
+  Envoy hook that can mutate headers, body and status of live traffic
+  in both directions. The redirect-rewrite case needs mutation.
+- Keeping both in one process means one policy language, one facts
+  registry, one reload path. Operators learn one tool.
+- The HTML for the interstitial is loaded as a `file`/`url` fact and
+  injected via a `setBody` mutation. The HTML never lives in code or in
+  the data plane.
+
+**Consequences.** The binary now links the Envoy ext_proc protos and a
+gRPC server. The policy grammar grows an explicit engine selector and a
+mutation vocabulary (D-016..D-021).
+
+## D-016 - Explicit `engine` per group, inside `parameters`
+
+**Context.** A group must declare whether it programs the ext_authz
+filter or the ext_proc filter. They are different Envoy filters with
+different contracts. Hiding which one a group targets (or inferring it
+from the rule contents) is exactly the confusion to avoid.
+
+**Decision.** Every group carries a `parameters` block. `parameters.engine`
+is `extAuthz | extProc`, required, no default. Engine-specific knobs live
+inside `parameters` too: `mode` (both engines) and `phase` (extProc only).
+
+```yaml
+groups:
+  - name: ...
+    parameters:
+      engine: extAuthz | extProc
+      mode: ...
+      phase: ...        # extProc only
+    match: ...          # group guard, optional
+    rules: [...]
+```
+
+**Reasoning.** `engine` is the vocabulary the platform team already speaks
+(they read `EnvoyFilter`/`WasmPlugin` daily). An explicit discriminator
+beats magic. `parameters` separates "engine wiring" from policy logic
+(`match`, `rules`).
+
+**Consequences.** The loader validates engine-specific coherence (D-017,
+D-018, D-021). A group is unambiguously routed to the HTTP server
+(extAuthz) or the gRPC server (extProc) by `engine` alone.
+
+## D-017 - Mode names are engine-specific to avoid a colliding `all`
+
+**Context.** Both engines compose rules, but the composition means
+different things. extAuthz composes verdicts; extProc composes mutations.
+Reusing `mode: all` for both would make one keyword mean "every rule must
+hold (logical AND, else deny)" in one engine and "apply the mutations of
+every matching rule" in the other.
+
+**Decision.** Distinct names per engine:
+
+- extAuthz: `mode: firstMatch | matchAll`
+- extProc:  `mode: firstMatch | applyAll`
+
+`firstMatch` means the same on both (first rule whose `match` is true
+decides/applies, then stop). `matchAll` is the logical-AND verdict mode
+(every rule must match or the group denies). `applyAll` accumulates the
+mutations of every matching rule, in declaration order.
+
+**Reasoning.** Same word, same meaning; different behaviour, different
+word. The verb in the name tells the user what the group does.
+
+**Consequences.** The loader rejects any mode not valid for the group's
+engine. `firstMatch` is the only shared value.
+
+## D-018 - Homogeneous rule body: `validation` (singular) XOR `mutations`
+
+**Context.** A rule must read clearly as either "this decides" or "this
+mutates". The two engines never mix in v1.
+
+**Decision.**
+
+- A rule's `match` is a **mandatory** CEL bool. There is no implicit
+  `true` default any more, and `fallthrough` is removed. In `firstMatch`
+  the first rule whose `match` is true wins; if none match, the group
+  produces no verdict and evaluation falls through to the next group /
+  `defaults`.
+- An extAuthz rule carries `validation: { action: allow | deny }`. It is
+  a singular object, not a list: a rule produces exactly one verdict.
+  Group-to-rule action inheritance (old D-004) is removed; each rule
+  states its own verdict.
+- An extProc rule carries `mutations: [ ... ]`, a real list (a rule may
+  legitimately apply several mutations). An empty `mutations: []` is a
+  valid "matched but change nothing" that still stops a `firstMatch`
+  group.
+
+**Reasoning.** `validation`/`mutations` name the intent. Mandatory
+`match` and no inheritance remove the invisible-default footguns that
+D-003/D-004 still allowed. One rule = one condition = one effect (verdict
+or a set of mutations); several conditional effects are several rules.
+This supersedes the default-`true` of D-003, the inheritance of D-004 and
+the `fallthrough` of D-005.
+
+**Consequences.** Examples get slightly longer (explicit `match: 'true'`
+for a fallback rule, explicit `action` on every extAuthz rule) in
+exchange for zero hidden behaviour.
+
+## D-019 - Mutation ops: explicit `op` discriminator, fixed catalogue
+
+**Context.** Each item in `mutations` needs a clear, validatable shape.
+
+**Decision.** Each mutation is an object with an explicit `op` field and
+its operands. v1 catalogue:
+
+| op             | fields       | legal phases                  | semantics                                  |
+| -------------- | ------------ | ----------------------------- | ------------------------------------------ |
+| `setHeader`    | name, value  | all                           | upsert: overwrite if present, else create  |
+| `appendHeader` | name, value  | all                           | add a value, keep existing ones            |
+| `removeHeader` | name         | all                           | delete the header; no-op if absent         |
+| `setBody`      | value        | requestBody, responseBody     | replace the body; recomputes Content-Length|
+| `setStatus`    | code         | responseHeaders, responseBody | set the response status code               |
+
+`value`/`code` are CEL expressions (string for header/body, int for
+status). On `applyAll`, when two matching rules write the same header the
+last one in declaration order wins.
+
+**Reasoning.** Explicit `op` is a clean switch in Go, easy to validate,
+no "map with a single key" trick. `setHeader` as upsert is the least
+surprising default. `removeHeader` is idempotent. `setBody` owns
+Content-Length recomputation because making the user maintain it by hand
+is a trap; Content-Type stays the user's responsibility.
+
+**Consequences.** `setStatus`/`setBody` legality depends on the group's
+`phase`; the loader enforces it. Body-rewriting phases require Envoy to
+buffer the body (D-021).
+
+## D-020 - CEL `response` variable; typed mutation expressions
+
+**Context.** Response-phase policies need to see the upstream response.
+Mutation expressions return strings/ints, not booleans.
+
+**Decision.**
+
+- Add a CEL variable `response` (headers/header, status, body.json/yaml/raw),
+  shaped like `request`. Live variables depend on the phase:
+  - request phases (`requestHeaders`, `requestBody`): `request`, `facts`.
+  - response phases (`responseHeaders`, `responseBody`): `request`,
+    `response`, `facts`.
+- `match` expressions are compiled and checked as bool (as today).
+  Mutation `value`/`code` expressions are a second kind of program,
+  checked for string/int output type at load time. A rule that references
+  `response` in a request phase fails to compile, not at runtime.
+
+**Reasoning.** Deriving live variables from the phase makes the
+variable contract impossible to violate silently. Output-type checking at
+load turns a class of runtime errors into load errors.
+
+**Consequences.** `celenv.Compile` gains a typed variant (or a parameter)
+for non-bool expressions. The env is built per-phase or the variables are
+registered and the loader rejects out-of-phase references.
+
+## D-021 - Per-engine `defaults`; ext_authz body overflow is fixed deny
+
+**Context.** `defaults.action` and `defaults.denyStatus` only make sense
+for ext_authz; ext_proc does not "deny", it mutates. A flat `defaults`
+mixing both engines breeds orphan fields. Body buffering limits matter to
+both engines but can want different values.
+
+**Decision.** Split defaults per engine; each block is self-contained:
+
+```yaml
+defaults:
+  extAuthz:
+    action: deny
+    denyStatus: 403
+    denyBody: "Forbidden"
+    allowOnError: false
+    maxBodyBytes: 1MiB
+  extProc:
+    maxBodyBytes: 1MiB
+    onBodyOverflow: skip | fail
+  dryRun: false        # global, both engines (D-022)
+```
+
+- `onBodyOverflow` exists **only** for extProc (`skip`: don't mutate, let
+  the original body pass; `fail`: immediate-response, fail-closed). There
+  is no `truncate`.
+- ext_authz body overflow is **not configurable**: it is a fixed
+  fail-closed deny. A gatekeeper that cannot read the whole request does
+  not admit it. (This changes the old behaviour of truncating and
+  evaluating with a partial body.)
+
+**Reasoning.** Per-engine blocks make every knob's scope obvious and let
+the gatekeeper and the surgeon tune body limits independently. Truncate
+is dropped everywhere because a partial body yields wrong matches and
+half-rewritten bodies.
+
+**Consequences.** Flat `defaults.action`/`maxBodyBytes`/etc. no longer
+exist; they move under `defaults.extAuthz`. This is a breaking config
+change with no migration shim (intentional).
+
+## D-022 - Dry-run stays global and suppresses every enforcing path
+
+**Context.** Operators want to shadow the whole policy (both engines)
+before it can affect traffic.
+
+**Decision.** `defaults.dryRun` stays a single global switch (no
+per-engine split for now). Per-rule `dryRun` also stays. When dry-run is
+on, no path touches traffic:
+
+- extAuthz: a `deny` verdict is logged/metered as "would deny" but
+  returns 200. A body-overflow that would deny also passes with 200.
+- extProc: mutations are computed and logged ("would setHeader ...") but
+  the gRPC stream responds CONTINUE with no mutation. An overflow that
+  would `fail` is logged as "would fail" and passes.
+
+**Reasoning.** Shadow mode must be observe-only on every branch, not just
+the happy path, or the preview lies.
+
+**Consequences.** Both servers route their enforcement through a single
+`effectiveDry` check before emitting the verdict/mutation, mirroring the
+existing httpserver pattern (D-014).
+
+
+## D-023 - `directResponse` op: short-circuit and serve a response
+
+**Context.** The flagship case (intercept Keycloak's DCR `302` to an
+untrusted destination and show the user a warning page) is not a header
+mutation: it is replacing the upstream response entirely with our own.
+Expressing it as `setStatus` + `setHeader` + `setBody` has two problems:
+`setBody` is illegal in `responseHeaders` (D-019) and the `responseBody`
+phase never fires for a bodiless `302`, so the only phase that runs is
+`responseHeaders`, where the incremental mutation ops cannot build a full
+response. It is also three coupled mutations that only make sense
+together.
+
+**Decision.** A dedicated extProc op, `directResponse`, that maps to
+Envoy's `ImmediateResponse`: it discards the upstream response and serves
+the one the rule builds. Shape:
+
+```yaml
+- op: directResponse
+  status: 200            # int literal
+  headers: |             # CEL expression evaluating to map<string,string>
+    {"content-type": "text/html"}
+  body: |                # CEL expression evaluating to string
+    facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(response.header['location']))
+```
+
+- `status` is an int literal (a CEL-computed status is YAGNI and less
+  readable).
+- `headers` is a CEL expression returning `map<string,string>`. This is
+  the single mechanism for every header need: a map literal for fixed
+  values, `response.header` to carry over all of the original headers
+  ("give me all of them"), and filter/merge expressions for any subset or
+  override. There is no inherit-by-default; the response is built from
+  scratch, which is faithful to the op's name. Header values are single
+  strings (no multi-value output); the rare multi-value case is out of
+  scope for v1.
+- `body` is a CEL expression returning a string.
+
+`directResponse` is legal in `responseHeaders` and `responseBody`. In
+`responseHeaders` it works even when upstream sent no body, which is the
+`302` case. It is self-contained: a rule carrying `directResponse` must
+not also carry any incremental op (setHeader/appendHeader/removeHeader/
+setBody/setStatus). The loader rejects the mix. In `applyAll`, the first
+rule that fires a `directResponse` wins and stops the group (you cannot
+short-circuit twice).
+
+**Reasoning.** What the user wants is "abort and serve this", which is an
+ImmediateResponse, not a mutation. Treating `headers` as data built by a
+CEL expression (like `body` already is) keeps one paradigm across the DSL
+and removes the earlier dead ends (a `headers` map of CEL strings forced
+`"'text/html'"` per entry; a list with value/expr/from/all/remove verbs
+was a sub-language nobody wanted). "Give me all the original headers" is
+just the expression `response.header`.
+
+**Consequences.**
+
+- celenv gains a fourth compiled kind: `CompileStringMap` /
+  `EvalStringMap` (output `map<string,string>`), same pattern as the bool/
+  string/int variants. Output type is checked at load; a runtime value
+  that is not a string map is fail-safe (the directResponse is not
+  emitted).
+- The resolved-mutation model grows a variant carrying status + headers +
+  body. The gRPC server maps it to `ImmediateResponse{Status, Headers,
+  Body}` instead of a `CommonResponse` mutation.
+- Under global or per-rule dry-run, `directResponse` is computed and
+  logged ("would directRespond") but not served; the stream responds
+  CONTINUE.
+- Security note for the interstitial recipe: the original `Location` is
+  attacker-controlled (untrusted DCR client). It must be encoded before
+  being placed in the page (base64 in CEL, decoded by the button's JS) to
+  avoid HTML injection. The example uses `base64.encode(...)` and a
+  `__TARGET_B64__` placeholder.
