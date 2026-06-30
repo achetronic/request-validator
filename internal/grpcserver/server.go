@@ -330,7 +330,13 @@ func (s *Server) handleProcResult(phase string, res policy.ProcResult, p *policy
 		}
 	}
 
-	log.Infow("extProc phase evaluated",
+	// Only the no-op case (nothing applied, nothing shadowed) is logged at
+	// DEBUG: at INFO it floods, since extProc runs on every request/phase.
+	logProc := log.Infow
+	if len(appliedLog) == 0 && len(shadowLog) == 0 {
+		logProc = log.Debugw
+	}
+	logProc("extProc phase evaluated",
 		"engine", "extProc",
 		"phase", phase,
 		"applied", appliedLog,
