@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Package log is a thin wrapper around log/slog that gives the rest of the
 // project a single, opinionated logger.
 //

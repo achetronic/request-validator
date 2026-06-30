@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Package httpserver exposes the ext-authz HTTP endpoint.
 //
 // Envoy/Istio is expected to forward the original downstream request to this

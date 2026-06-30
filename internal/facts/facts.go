@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Package facts owns the "facts" feature of the policy DSL.
 //
 // A `facts` entry is a named value that policies can reference from any CEL
