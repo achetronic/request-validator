@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // request-validator is a generic ext-authz HTTP service that decides
 // allow / deny for incoming requests based on a declarative YAML policy.
 //

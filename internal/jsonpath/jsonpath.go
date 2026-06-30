@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Package jsonpath implements a tiny subset of JSONPath used by request-validator.
 //
 // Supported syntax (a deliberate, minimal subset):

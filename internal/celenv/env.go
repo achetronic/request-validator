@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Package celenv builds the CEL environment used by request-validator
 // policies, registers the custom functions and provides a program cache.
 package celenv

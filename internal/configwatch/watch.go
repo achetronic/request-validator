@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Package configwatch watches a single configuration file for changes and
 // invokes a callback whenever the file is rewritten.
 //
