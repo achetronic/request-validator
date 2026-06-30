@@ -2,6 +2,7 @@ package celenv
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -366,5 +367,51 @@ func TestCompileStringMap_MapMergeNotSupported(t *testing.T) {
 		t.Fatal("expected compilation to fail for map '+' operator, or does this version of cel-go actually support it?")
 	} else {
 		t.Logf("CompileStringMap for map '+' operator failed as expected: %v", err)
+	}
+}
+
+// TestBase64EncodeNeedsBytesString is a regression canary for the interstitial
+// recipe's `body` expression. base64.encode comes from ext.Encoders() and only
+// has a bytes overload; response.header['x'] is a dyn that resolves to a string
+// at runtime. So the tempting `base64.encode(response.header['location'])`
+// COMPILES (dyn defers the check) but fails at RUNTIME with "no such overload:
+// base64.encode(string)", and the directResponse mutation is silently dropped
+// (the interstitial never shows). bytes(dyn) does not resolve either. The
+// working form needs an explicit string() to type the dyn before bytes():
+//
+//	base64.encode(bytes(string(response.header['location'])))
+//
+// If anyone "simplifies" the example/README/DECISIONS recipe back to the bare
+// form, this test fails. See examples/policy.yaml.
+func TestBase64EncodeNeedsBytesString(t *testing.T) {
+	env, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The working form the docs use: must compile AND evaluate to base64.
+	good := `base64.encode(bytes(string(response.header['location'])))`
+	prog, err := env.CompileString(good, ScopeResponse)
+	if err != nil {
+		t.Fatalf("working form must compile: %v", err)
+	}
+	out, err := EvalString(context.Background(), prog, responseVars())
+	if err != nil {
+		t.Fatalf("working form must evaluate: %v", err)
+	}
+	if want := base64.StdEncoding.EncodeToString([]byte("https://attacker.example/cb")); out != want {
+		t.Fatalf("base64 mismatch: got %q want %q", out, want)
+	}
+
+	// The bare form (the old bug): compiles but must fail at runtime. If a
+	// future cel-go grows a string overload and this starts passing, drop the
+	// bytes(string(...)) dance from the docs.
+	bad := `base64.encode(response.header['location'])`
+	prog, err = env.CompileString(bad, ScopeResponse)
+	if err != nil {
+		t.Skipf("bare form no longer compiles (%v); recipe is safe either way", err)
+	}
+	if _, err := EvalString(context.Background(), prog, responseVars()); err == nil {
+		t.Fatal("bare base64.encode(string) must fail at runtime; if it now works, simplify the interstitial recipe in examples/policy.yaml, README.md and .agents/DECISIONS.md")
 	}
 }

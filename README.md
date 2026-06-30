@@ -536,7 +536,7 @@ groups:
           - op: directResponse
             status: 200
             headers: '{"content-type": "text/html"}'
-            body: "facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(response.header['location']))"
+            body: "facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(bytes(string(response.header['location']))))"
 ```
 
 The interstitial HTML is loaded once as a `file` fact and carries a `__TARGET_B64__` placeholder that the `body` expression fills in. A minimal page lives in [`examples/interstitial.html`](examples/interstitial.html). The Istio wiring for this engine is in [`examples/config-for-istio-extproc.yaml`](examples/config-for-istio-extproc.yaml).

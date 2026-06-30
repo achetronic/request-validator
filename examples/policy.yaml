@@ -310,7 +310,7 @@ groups:
           - op: directResponse
             status: 200
             headers: '{"content-type": "text/html"}'
-            body: "facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(response.header['location']))"
+            body: "facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(bytes(string(response.header['location']))))"
 
   # Strip sensitive internal headers from all upstream responses.
   - name: downstream-header-stripper

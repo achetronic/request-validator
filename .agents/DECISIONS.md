@@ -542,7 +542,7 @@ the one the rule builds. Shape:
   headers: |             # CEL expression evaluating to map<string,string>
     {"content-type": "text/html"}
   body: |                # CEL expression evaluating to string
-    facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(response.header['location']))
+    facts.interstitialHtml.replace('__TARGET_B64__', base64.encode(bytes(string(response.header['location']))))
 ```
 
 - `status` is an int literal (a CEL-computed status is YAGNI and less
