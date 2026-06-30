@@ -4,7 +4,7 @@
 # produce linux/amd64 and linux/arm64 from the same Dockerfile.
 
 # --- build stage ---
-FROM --platform=$BUILDPLATFORM golang:1.23 AS build
+FROM --platform=$BUILDPLATFORM golang:1.24 AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
