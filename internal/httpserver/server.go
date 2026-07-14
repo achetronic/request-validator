@@ -37,6 +37,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"request-validator/internal/accesslog"
 	"request-validator/internal/log"
 	"request-validator/internal/policy"
 )
@@ -177,7 +178,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			"reason", "request body too large",
 			"dry_run", dry,
 			"duration_ms", float64(time.Since(start).Microseconds()) / 1000.0,
-			accessLogAttrs(req, p.Logging),
+			accesslog.RequestAttrs(req, p.Logging),
 		}
 		logger.Warn("request decided", rec...)
 		return
@@ -235,7 +236,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		"reason", d.Reason,
 		"dry_run", effectiveDry,
 		"duration_ms", float64(time.Since(start).Microseconds()) / 1000.0,
-		accessLogAttrs(req, p.Logging),
+		accesslog.RequestAttrs(req, p.Logging),
 	}
 	if d.Allowed {
 		logger.Info("request decided", rec...)
