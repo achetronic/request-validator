@@ -78,6 +78,11 @@ logging:
   redactQueryParams: [access_token, id_token, code]
 ```
 
+The logging block applies to BOTH engines:
+
+- extAuthz emits one access record per delegated request ("request decided").
+- extProc emits one access record per phase message at INFO ("extProc access"). The request and/or response body appears in extProc logs only when Envoy's processing_mode actually sends the body AND logBody is true. extProc records carry a stream_id shared by all phases of one HTTP request (one ext_proc stream = one request) and a request_id copied from the x-request-id header when present.
+
 Behaviour:
 
 - Header keys are normalised to lowercase before exclude/redact checks.

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Alby Hernández <hola@achetronic.com>
 // SPDX-License-Identifier: Apache-2.0
 
-package httpserver
+// Package accesslog provides utilities for structured access logging across both engines.
+package accesslog
 
 import (
 	"log/slog"
@@ -11,14 +12,11 @@ import (
 	"request-validator/internal/policy"
 )
 
-// accessLogAttrs builds the slog group describing a single request. The
-// caller adds higher-level fields (decision, rule, reason, dryRun, duration)
-// around it; this function is concerned only with what came in.
-//
+// RequestAttrs builds the slog group describing a single request.
 // Header keys are always lowercase. Excluded headers are dropped, redacted
 // headers have their values masked. The body is included only when
 // logging.LogBody is true; the body size is included always.
-func accessLogAttrs(req *policy.Request, lg policy.Logging) slog.Attr {
+func RequestAttrs(req *policy.Request, lg policy.Logging) slog.Attr {
 	exclude := lowerSet(lg.ExcludeHeaders)
 	redact := lowerSet(lg.RedactHeaders)
 
@@ -56,6 +54,57 @@ func accessLogAttrs(req *policy.Request, lg policy.Logging) slog.Attr {
 		slog.String("path", req.Path),
 		slog.String("query", q),
 		slog.String("remote_ip", req.RemoteIP),
+		slog.Group("headers", hdrs...),
+		body,
+	)
+}
+
+// ResponseAttrs builds the slog group describing a single response.
+// Header keys are always lowercase. Excluded headers are dropped, redacted
+// headers have their values masked. The body is included only when
+// logging.LogBody is true; the body size is included always.
+func ResponseAttrs(resp *policy.Response, lg policy.Logging) slog.Attr {
+	if resp == nil {
+		return slog.Group("response",
+			slog.Int("status", 0),
+			slog.Group("headers"),
+			slog.Group("body",
+				slog.Int("size", 0),
+				slog.String("content_type", ""),
+			),
+		)
+	}
+
+	exclude := lowerSet(lg.ExcludeHeaders)
+	redact := lowerSet(lg.RedactHeaders)
+
+	hdrs := make([]any, 0, len(resp.Headers)*2)
+	for k, vs := range resp.Headers {
+		lk := strings.ToLower(k)
+		if exclude[lk] {
+			continue
+		}
+		joined := strings.Join(vs, ", ")
+		if redact[lk] {
+			joined = mask(joined, lg.RedactReveal)
+		}
+		hdrs = append(hdrs, slog.String(lk, joined))
+	}
+
+	body := slog.Group("body",
+		slog.Int("size", len(resp.Body)),
+		slog.String("content_type", strings.ToLower(resp.Headers.Get("Content-Type"))),
+	)
+	if lg.LogBody && len(resp.Body) > 0 {
+		body = slog.Group("body",
+			slog.Int("size", len(resp.Body)),
+			slog.String("content_type", strings.ToLower(resp.Headers.Get("Content-Type"))),
+			slog.String("raw", string(resp.Body)),
+		)
+	}
+
+	return slog.Group("response",
+		slog.Int("status", resp.Status),
 		slog.Group("headers", hdrs...),
 		body,
 	)

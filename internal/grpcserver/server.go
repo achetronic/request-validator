@@ -5,6 +5,8 @@
 package grpcserver
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,12 +16,14 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	epb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc"
 
+	"request-validator/internal/accesslog"
 	"request-validator/internal/log"
 	"request-validator/internal/policy"
 )
@@ -75,6 +79,7 @@ func (s *Server) Stop() {
 
 // Process implements the bidirectional processing stream.
 func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
+	streamID := newStreamID()
 	ctx := stream.Context()
 	var req *policy.Request
 	var resp *policy.Response
@@ -100,8 +105,20 @@ func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
 		switch r := reqMsg.Request.(type) {
 		case *epb.ProcessingRequest_RequestHeaders:
 			req = parseRequestHeaders(r.RequestHeaders)
+			accessArgs := []any{
+				"engine", "extProc",
+				"stream_id", streamID,
+				"phase", "requestHeaders",
+				accesslog.RequestAttrs(req, p.Logging),
+			}
+			if req != nil {
+				if reqID := req.Headers.Get("x-request-id"); reqID != "" {
+					accessArgs = append(accessArgs, "request_id", reqID)
+				}
+			}
+			log.Logger().Info("extProc access", accessArgs...)
 			res := p.EvaluateProc(ctx, "requestHeaders", req, nil)
-			respMsg := s.handleProcResult("requestHeaders", res, p)
+			respMsg := s.handleProcResult(streamID, "requestHeaders", res, p)
 			if err := stream.Send(respMsg); err != nil {
 				return err
 			}
@@ -117,6 +134,7 @@ func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
 			if int64(len(req.Body)) > limit {
 				onBodyOverflow := p.Defaults.ExtProc.OnBodyOverflow
 				log.Warnw("ext_proc body overflow",
+					"stream_id", streamID,
 					"phase", "requestBody",
 					"limit", limit,
 					"body_size", len(req.Body),
@@ -169,8 +187,20 @@ func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
 				continue
 			}
 
+			accessArgs := []any{
+				"engine", "extProc",
+				"stream_id", streamID,
+				"phase", "requestBody",
+				accesslog.RequestAttrs(req, p.Logging),
+			}
+			if req != nil {
+				if reqID := req.Headers.Get("x-request-id"); reqID != "" {
+					accessArgs = append(accessArgs, "request_id", reqID)
+				}
+			}
+			log.Logger().Info("extProc access", accessArgs...)
 			res := p.EvaluateProc(ctx, "requestBody", req, nil)
-			respMsg := s.handleProcResult("requestBody", res, p)
+			respMsg := s.handleProcResult(streamID, "requestBody", res, p)
 			if err := stream.Send(respMsg); err != nil {
 				return err
 			}
@@ -180,8 +210,21 @@ func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
 				req = &policy.Request{Headers: make(http.Header)}
 			}
 			resp = parseResponseHeaders(r.ResponseHeaders)
+			accessArgs := []any{
+				"engine", "extProc",
+				"stream_id", streamID,
+				"phase", "responseHeaders",
+				accesslog.RequestAttrs(req, p.Logging),
+				accesslog.ResponseAttrs(resp, p.Logging),
+			}
+			if req != nil {
+				if reqID := req.Headers.Get("x-request-id"); reqID != "" {
+					accessArgs = append(accessArgs, "request_id", reqID)
+				}
+			}
+			log.Logger().Info("extProc access", accessArgs...)
 			res := p.EvaluateProc(ctx, "responseHeaders", req, resp)
-			respMsg := s.handleProcResult("responseHeaders", res, p)
+			respMsg := s.handleProcResult(streamID, "responseHeaders", res, p)
 			if err := stream.Send(respMsg); err != nil {
 				return err
 			}
@@ -200,6 +243,7 @@ func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
 			if int64(len(resp.Body)) > limit {
 				onBodyOverflow := p.Defaults.ExtProc.OnBodyOverflow
 				log.Warnw("ext_proc body overflow",
+					"stream_id", streamID,
 					"phase", "responseBody",
 					"limit", limit,
 					"body_size", len(resp.Body),
@@ -252,8 +296,14 @@ func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
 				continue
 			}
 
+			log.Logger().Info("extProc access",
+				"engine", "extProc",
+				"stream_id", streamID,
+				"phase", "responseBody",
+				accesslog.ResponseAttrs(resp, p.Logging),
+			)
 			res := p.EvaluateProc(ctx, "responseBody", req, resp)
-			respMsg := s.handleProcResult("responseBody", res, p)
+			respMsg := s.handleProcResult(streamID, "responseBody", res, p)
 			if err := stream.Send(respMsg); err != nil {
 				return err
 			}
@@ -268,7 +318,7 @@ func (s *Server) Process(stream epb.ExternalProcessor_ProcessServer) error {
 }
 
 // handleProcResult filters shadow mutations and logs/builds the processing response.
-func (s *Server) handleProcResult(phase string, res policy.ProcResult, p *policy.Config) *epb.ProcessingResponse {
+func (s *Server) handleProcResult(streamID string, phase string, res policy.ProcResult, p *policy.Config) *epb.ProcessingResponse {
 	dryGlobal := p.Defaults.DryRun
 
 	// 1. CORTOCIRCUITO: check for first applied directResponse
@@ -277,6 +327,7 @@ func (s *Server) handleProcResult(phase string, res policy.ProcResult, p *policy
 		if m.Op == "directResponse" && !effectiveDry {
 			log.Infow("extProc phase evaluated",
 				"engine", "extProc",
+				"stream_id", streamID,
 				"phase", phase,
 				"direct_response", fmt.Sprintf("%s:%d", m.Rule, m.RespStatus),
 				"dry_run", false,
@@ -341,6 +392,7 @@ func (s *Server) handleProcResult(phase string, res policy.ProcResult, p *policy
 	}
 	logProc("extProc phase evaluated",
 		"engine", "extProc",
+		"stream_id", streamID,
 		"phase", phase,
 		"applied", appliedLog,
 		"shadow", shadowLog,
@@ -628,4 +680,15 @@ func extractClientIP(h http.Header) string {
 		return strings.TrimSpace(xri)
 	}
 	return ""
+}
+
+// newStreamID generates a 16-character hex-encoded correlation ID using 8 random bytes.
+// Envoy opens one ext_proc gRPC stream per HTTP request, so a per-stream ID correlates
+// all phase logs of one request. If crypto/rand fails, it falls back to a hex-encoded timestamp.
+func newStreamID() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }

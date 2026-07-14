@@ -591,3 +591,29 @@ just the expression `response.header`.
   being placed in the page (base64 in CEL, decoded by the button's JS) to
   avoid HTML injection. The example uses `base64.encode(...)` and a
   `__TARGET_B64__` placeholder.
+
+
+## D-024 - Unified, engine-agnostic access logging
+
+**Context.** Originally, only the extAuthz engine supported access logging using the `logging` block configuration. The extProc engine had no structured access logging capability.
+
+**Decision.** Unify the access-logging capability across both engines using a new shared package `internal/accesslog`. The extProc engine will emit a structured access log record at INFO level ("extProc access") for every phase message Envoy sends, unconditionally.
+
+- `requestHeaders` phase logs `accesslog.RequestAttrs`.
+- `requestBody` phase logs `accesslog.RequestAttrs` (containing the accumulated body).
+- `responseHeaders` phase logs `accesslog.RequestAttrs` and `accesslog.ResponseAttrs`.
+- `responseBody` phase logs `accesslog.ResponseAttrs` (containing the accumulated response body).
+
+The existing per-request custom headers, redactions, masking, and body log toggle configurations under the `logging` block apply symmetrically to both engines.
+
+**Rationale.** The request validator is a generic gatekeeping product. The deployment-side EnvoyFilter configuration controls which messages and metadata reach the extProc server. Delegating traffic volume and level details to Envoy's filters is standard practice; therefore, the validator does not need to duplicate these knobs internally, and can log every received message uniformly.
+
+**Alternative Rejected.**
+- Logging only on a rule match: rejected because operators need visibility into all traffic flowing through the validator, not just match events.
+- Configurable per-phase logging knobs: rejected to avoid redundant configuration overhead and keep the code path simple.
+
+**Consequences.**
+- Extracted common header exclusion/redaction and body formatting logic into a unified `internal/accesslog` package.
+- Solved the logging gap where extProc was entirely blind to structured, redacted request/response auditing.
+- No behavior or schema changes for extAuthz logs.
+
