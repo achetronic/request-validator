@@ -295,3 +295,77 @@ func TestResponseAttrsBodyOnlyWhenLogBody(t *testing.T) {
 		}
 	}
 }
+
+func TestResponseAttrsNilResponse(t *testing.T) {
+	var buf bytes.Buffer
+	if err := log.Configure(log.Options{Level: "info", Format: log.FormatJSON, Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Configure(log.Options{}) })
+
+	attr := ResponseAttrs(nil, policy.Logging{})
+
+	log.Logger().Info("test_nil_resp", attr)
+
+	out := buf.String()
+	var rec map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &rec); err != nil {
+		t.Fatalf("invalid JSON output: %v -- %s", err, out)
+	}
+
+	respRec, ok := rec["response"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing response group in log: %s", out)
+	}
+
+	if int(respRec["status"].(float64)) != 0 {
+		t.Fatalf("status mismatch: %v", respRec["status"])
+	}
+
+	body, ok := respRec["body"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing body in response log: %s", out)
+	}
+
+	if int(body["size"].(float64)) != 0 {
+		t.Fatalf("body size mismatch: %v", body["size"])
+	}
+}
+
+func TestRedactedQueryPairWithoutEquals(t *testing.T) {
+	var buf bytes.Buffer
+	if err := log.Configure(log.Options{Level: "info", Format: log.FormatJSON, Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Configure(log.Options{}) })
+
+	req := &policy.Request{
+		RawQuery: "code=secret&standalone&id_token=x",
+	}
+	lg := policy.Logging{
+		RedactQueryParams: []string{"code", "id_token"},
+	}
+
+	log.Logger().Info("test_query", RequestAttrs(req, lg))
+
+	out := buf.String()
+	var rec map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &rec); err != nil {
+		t.Fatalf("invalid JSON output: %v -- %s", err, out)
+	}
+
+	reqRec, ok := rec["request"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing request group in log: %s", out)
+	}
+
+	queryVal, ok := reqRec["query"].(string)
+	if !ok {
+		t.Fatalf("query field missing in request log: %s", out)
+	}
+
+	expected := "code=***&standalone&id_token=***"
+	if queryVal != expected {
+		t.Fatalf("expected query to be %q, got %q", expected, queryVal)
+	}
+}
